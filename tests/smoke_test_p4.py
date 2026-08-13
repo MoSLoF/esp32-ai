@@ -370,6 +370,67 @@ def test_mesh_rejects_nested_relay():
     )
 
 
+def test_companion_json_escaping():
+    """All companion TX functions must escape string params with _comp_esc."""
+    comp = read_file("companion_uart.h")
+    assert comp is not None
+    for fn in ["companion_send_status", "companion_send_event",
+               "companion_send_peer"]:
+        start = comp.index(fn + "(")
+        block = comp[start:comp.index("\n}\n", start)]
+        assert "_comp_esc(" in block, (
+            f"{fn} must escape string params with _comp_esc()"
+        )
+
+
+def test_sd_cat_path_traversal():
+    """The 'cat' command must reject paths containing '..'."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert '".."' in ino or "'..' " in ino or 'indexOf("..")' in ino, (
+        "cat command must check for path traversal (..)"
+    )
+
+
+def test_ota_offer_cooldown():
+    """OTA must have a cooldown between offer acceptance."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    assert "OTA_OFFER_COOLDOWN" in ota, (
+        "ota_espnow.h must define OTA_OFFER_COOLDOWN"
+    )
+    assert "last_offer_time" in ota, (
+        "ota_espnow.h must track last offer time"
+    )
+
+
+def test_peer_table_eviction():
+    """Peer table must evict stale peers when full."""
+    pp = read_file("peer_protocol.h")
+    assert pp is not None
+    assert "victim" in pp or "evict" in pp, (
+        "peer_protocol.h must have peer eviction logic"
+    )
+
+
+def test_sd_csv_sanitize():
+    """SD log functions must sanitize CSV fields."""
+    sd = read_file("sd_config.h")
+    assert sd is not None
+    assert "_sd_sanitize_csv" in sd, (
+        "sd_config.h must have CSV sanitization function"
+    )
+
+
+def test_sd_without_peer_protocol():
+    """sd_config.h must compile without peer_protocol.h (USE_SD=1, USE_PEER_PROTOCOL=0)."""
+    sd = read_file("sd_config.h")
+    assert sd is not None
+    assert "PEER_IDENTITY_H" in sd or "PEER_PROTOCOL_H" in sd, (
+        "sd_config.h must guard peer-protocol-specific symbols with include guards"
+    )
+
+
 if __name__ == "__main__":
     # Run all test_* functions and report.
     tests = [(name, obj) for name, obj in sorted(globals().items())
