@@ -380,17 +380,34 @@ static void peer_tick() {
     if (now - p->first_seen < PEER_CHALLENGE_DELAY) continue;
 
     uint32_t h = _pr.device_id ^ p->device_id;
-    int idx = (_pr.device_id < p->device_id)
-        ? (int)(h % N_CHAL_BANK)
-        : (int)((h + 1) % N_CHAL_BANK);
-    const int *prompt = CHALLENGE_BANK[idx];
+
+    // Prefer SD-loaded challenges when available, fall back to compiled-in bank.
+    const int *prompt = NULL;
+    int prompt_len = PEER_PROMPT_LEN;
+#if USE_SD
+    int n_sd = sd_challenge_count();
+    if (n_sd > 0) {
+      int idx = (_pr.device_id < p->device_id)
+          ? (int)(h % n_sd)
+          : (int)((h + 1) % n_sd);
+      prompt = sd_challenge(idx, &prompt_len);
+      if (prompt_len > PEER_PROMPT_LEN) prompt_len = PEER_PROMPT_LEN;
+    }
+#endif
+    if (!prompt) {
+      int idx = (_pr.device_id < p->device_id)
+          ? (int)(h % N_CHAL_BANK)
+          : (int)((h + 1) % N_CHAL_BANK);
+      prompt = CHALLENGE_BANK[idx];
+      prompt_len = PEER_PROMPT_LEN;
+    }
 
     Serial.printf("[>] challenging %s...  %s\n",
                   p->name, persona()->quip_challenge);
-    p->n_expected = _pr.infer(prompt, PEER_PROMPT_LEN,
+    p->n_expected = _pr.infer(prompt, prompt_len,
                                PEER_RESP_LEN, p->expected);
     p->challenge_id = _pr.next_cid++;
-    _pr_tx_challenge(p->mac, prompt, PEER_PROMPT_LEN,
+    _pr_tx_challenge(p->mac, prompt, prompt_len,
                       p->challenge_id, PEER_RESP_LEN);
     p->challenge_sent = true;
     p->challenge_time = now;
