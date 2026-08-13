@@ -23,15 +23,33 @@ unaffordable, when in fact they are merely slow.
 
 import argparse
 
-# ESP32-S3-DevKitC-1 N16R8, the ordered board.
-SRAM_BYTES = 320 * 1024  # 512KB internal, minus IDF/stack/buffers. Conservative.
-PSRAM_BYTES = 8 * 1024 * 1024
-FLASH_BYTES = 15 * 1024 * 1024  # 16MB minus ~1MB firmware.
-# HISTORICAL PLANNING NUMBERS, kept so early sizing decisions stay reproducible.
-# Real measurements exist now (RESULTS.md): PSRAM 60.7 MB/s, flash 20.3us/512B
-# random read, ~9.5 tok/s end to end. This file is not deployment authority.
-PSRAM_BW = 60e6  # bytes/sec
-FLASH_BW = 60e6  # bytes/sec, sequential
+# ---- Target profiles --------------------------------------------------------
+TARGETS = {
+    "s3": {
+        "name": "ESP32-S3 N16R8",
+        "sram": 320 * 1024,       # 512KB internal, minus IDF/stack/buffers
+        "psram": 8 * 1024 * 1024,
+        "flash": 15 * 1024 * 1024,  # 16MB minus ~1MB firmware
+        "psram_bw": 60e6,         # measured 60.7 MB/s OPI
+        "flash_bw": 60e6,
+    },
+    "p4": {
+        "name": "ESP32-P4 (Waveshare P4NRW32)",
+        "sram": 600 * 1024,       # 768KB internal, minus IDF/stack/buffers
+        "psram": 32 * 1024 * 1024,
+        "flash": 31 * 1024 * 1024,  # 32MB minus ~1MB firmware
+        "psram_bw": 200e6,        # estimated, LPDDR-class
+        "flash_bw": 120e6,
+    },
+}
+
+# Default target for backward compatibility.
+_T = TARGETS["s3"]
+SRAM_BYTES = _T["sram"]
+PSRAM_BYTES = _T["psram"]
+FLASH_BYTES = _T["flash"]
+PSRAM_BW = _T["psram_bw"]
+FLASH_BW = _T["flash_bw"]
 
 
 def tiers(vocab, d_model, n_layers, ple_dim, ffn_hidden, n_heads=4):
@@ -76,23 +94,40 @@ def report(bits=4, **kw):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bits", type=int, default=4)
+    ap.add_argument("--target", choices=list(TARGETS), default=None,
+                    help="Target board (default: show all targets)")
     args = ap.parse_args()
 
-    print(f"\nESP32-S3 N16R8: {SRAM_BYTES // 1024}KB usable SRAM, "
-          f"{FLASH_BYTES // 1024 // 1024}MB usable flash, "
-          f"{PSRAM_BYTES // 1024 // 1024}MB PSRAM\n")
+    targets = [args.target] if args.target else list(TARGETS)
 
-    print("[what this repo actually validated]")
-    report(bits=args.bits, vocab=4096, d_model=128, n_layers=6, ple_dim=64, ffn_hidden=187)
+    for tkey in targets:
+        t = TARGETS[tkey]
+        global SRAM_BYTES, PSRAM_BYTES, FLASH_BYTES, PSRAM_BW, FLASH_BW
+        SRAM_BYTES = t["sram"]
+        PSRAM_BYTES = t["psram"]
+        FLASH_BYTES = t["flash"]
+        PSRAM_BW = t["psram_bw"]
+        FLASH_BW = t["flash_bw"]
 
-    print("[candidate deploy configs -- UNVALIDATED, sweep pending]")
-    for vocab, d, L, pd, ffn in [
-        (4096, 128, 6, 256, 128),
-        (8192, 192, 8, 256, 256),
-        (16384, 192, 8, 384, 256),
-        (32768, 256, 10, 512, 384),
-    ]:
-        report(bits=args.bits, vocab=vocab, d_model=d, n_layers=L, ple_dim=pd, ffn_hidden=ffn)
+        print(f"\n{'=' * 60}")
+        print(f"{t['name']}: {SRAM_BYTES // 1024}KB usable SRAM, "
+              f"{FLASH_BYTES // 1024 // 1024}MB usable flash, "
+              f"{PSRAM_BYTES // 1024 // 1024}MB PSRAM\n")
+
+        print("[validated config]")
+        report(bits=args.bits, vocab=4096, d_model=128, n_layers=6, ple_dim=64, ffn_hidden=187)
+
+        print("[deploy config]")
+        report(bits=args.bits, vocab=32768, d_model=96, n_layers=6, ple_dim=128, ffn_hidden=66)
+
+        if tkey == "p4":
+            print("[P4-only: configs that exceed S3 flash]")
+            for vocab, d, L, pd, ffn in [
+                (32768, 256, 10, 512, 384),
+                (32768, 192, 8, 384, 256),
+            ]:
+                report(bits=args.bits, vocab=vocab, d_model=d, n_layers=L,
+                       ple_dim=pd, ffn_hidden=ffn)
 
 
 if __name__ == "__main__":

@@ -75,7 +75,7 @@ static const uint8_t *bind_q(const uint8_t *p, QT *t, int rows, int cols) {
   t->n_groups = (cols + group - 1) / group;
   t->row_bytes = (cols + 1) / 2;
   t->codes = p;  p += (size_t)rows * t->row_bytes;
-  // Ensure 2-byte alignment for scales (Xtensa traps on misaligned loads).
+  // Ensure 2-byte alignment for scales (Xtensa traps; RISC-V handles but slower).
   if ((uintptr_t)p & 1) p++;
   t->scales = (const uint16_t *)p;  p += (size_t)rows * t->n_groups * 2;
   return p;
