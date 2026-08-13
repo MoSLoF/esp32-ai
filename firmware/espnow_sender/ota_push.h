@@ -33,13 +33,17 @@
 #define OTA_PUSH_CHUNK 226
 
 // EA-04: sender-side crypto state.
+// R2-04: no default PSK — must be provisioned at compile time.
 #ifndef CRYPTO_PSK
-#define CRYPTO_PSK "ple-tinylm-default-flock-key-v1"
+#error "CRYPTO_PSK must be defined — set via -DCRYPTO_PSK=\"...\""
 #endif
 
 static const char *_otap_psk = CRYPTO_PSK;
-static uint32_t _otap_epoch = 0;
-static uint32_t _otap_tx_seq = 0;
+// R2-03: epoch and tx_seq are shared with the sender's prompt path
+// to prevent sequence counter conflicts on the same MAC+epoch pair.
+// These are set to point to the sender's shared counters in espnow_sender.ino.
+static uint32_t *_otap_epoch_ptr = NULL;
+static uint32_t *_otap_tx_seq_ptr = NULL;
 static bool _otap_crypto_enabled = false;
 
 static struct {
@@ -54,6 +58,8 @@ static struct {
   uint32_t device_id;
   uint8_t *manifest;
   int manifest_len;
+  uint8_t receiver_mac[6];  // R2-05: MAC of the receiver we're serving
+  bool receiver_bound;
 } _otap;
 
 // ---- CRC32 -----------------------------------------------------------------
@@ -80,11 +86,12 @@ static struct {
 static int _otap_status_wr = 0, _otap_status_rd = 0;
 
 // EA-04: sign and send a frame.
+// R2-03: uses shared epoch/seq counters to prevent sequence conflicts.
 static void _otap_send_signed(const uint8_t *dest, uint8_t *frame,
                                int len) {
-  if (_otap_crypto_enabled && len > 0) {
-    uint32_t seq = _otap_tx_seq++;
-    len = crypto_env_sign(_otap_psk, frame, len, _otap_epoch, seq);
+  if (_otap_crypto_enabled && len > 0 && _otap_epoch_ptr && _otap_tx_seq_ptr) {
+    uint32_t seq = (*_otap_tx_seq_ptr)++;
+    len = crypto_env_sign(_otap_psk, frame, len, *_otap_epoch_ptr, seq);
   }
   esp_now_send(dest, frame, len);
 }
@@ -231,6 +238,7 @@ static void ota_push_start() {
 
   _otap.pushing = true;
   _otap.last_served = 0;
+  _otap.receiver_bound = false;
   Serial.println("[ota-push] offer broadcast, waiting for requests...");
 }
 
@@ -244,6 +252,11 @@ static void ota_push_tick() {
     if (rd == __atomic_load_n(&_otap_req_wr, __ATOMIC_ACQUIRE)) break;
 
     uint16_t seq = _otap_req_ring[rd].seq;
+    // R2-05: bind receiver MAC on first request.
+    if (!_otap.receiver_bound) {
+      memcpy(_otap.receiver_mac, _otap_req_ring[rd].mac, 6);
+      _otap.receiver_bound = true;
+    }
     if (seq < _otap.n_chunks) {
       uint32_t offset = (uint32_t)seq * _otap.chunk_size;
       uint32_t remaining = _otap.fw_size - offset;
@@ -270,19 +283,23 @@ static void ota_push_tick() {
     __atomic_store_n(&_otap_req_rd, (rd + 1) % OTAP_RING, __ATOMIC_RELEASE);
   }
 
-  // Drain status ring.
+  // R2-05: drain status ring — only accept status from the bound receiver.
   for (;;) {
     int rd = __atomic_load_n(&_otap_status_rd, __ATOMIC_RELAXED);
     if (rd == __atomic_load_n(&_otap_status_wr, __ATOMIC_ACQUIRE)) break;
 
     uint8_t st = _otap_status_ring[rd].status;
-    if (st == 1) {
-      Serial.println("[ota-push] receiver confirmed update complete!");
-      _otap.pushing = false;
-    } else if (st == 0 || st == 2) {
-      Serial.printf("[ota-push] receiver reported %s\n",
-                    st == 0 ? "abort" : "error");
-      _otap.pushing = false;
+    bool from_receiver = _otap.receiver_bound &&
+        memcmp(_otap_status_ring[rd].mac, _otap.receiver_mac, 6) == 0;
+    if (from_receiver) {
+      if (st == 1) {
+        Serial.println("[ota-push] receiver confirmed update complete!");
+        _otap.pushing = false;
+      } else if (st == 0 || st == 2) {
+        Serial.printf("[ota-push] receiver reported %s\n",
+                      st == 0 ? "abort" : "error");
+        _otap.pushing = false;
+      }
     }
     __atomic_store_n(&_otap_status_rd, (rd + 1) % OTAP_RING, __ATOMIC_RELEASE);
   }

@@ -11,6 +11,7 @@
 #ifndef LLM_H
 #define LLM_H
 #include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
 #include <string.h>
 
@@ -79,7 +80,7 @@ typedef struct {
 // extends past `end`.
 static const uint8_t *bind_q(const uint8_t *p, const uint8_t *end,
                               QT *t, int rows, int cols) {
-  if (!p || p + 4 > end) return NULL;
+  if (!p || (size_t)(end - p) < 4) return NULL;
   int32_t group; memcpy(&group, p, 4); p += 4;
   if (group <= 0 || group > cols) return NULL;
   t->rows = rows; t->cols = cols; t->group = group;
@@ -255,7 +256,7 @@ static int llm_load(const uint8_t *base, size_t buf_len, Model *m) {
   int F = m->c.ffn, P = m->c.ple_dim, S = m->c.seq_len, G = m->c.group;
   if (V <= 0 || V > 65536) return -2;
   if (D <= 0 || D > 4096)  return -2;
-  if (L < 0  || L > 32)    return -2;
+  if (L <= 0 || L > 32)    return -2;
   if (H <= 0 || H > 256)   return -2;
   if (D % H != 0)          return -2;
   if (F <= 0 || F > 16384) return -2;

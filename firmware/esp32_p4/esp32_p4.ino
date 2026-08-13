@@ -210,9 +210,19 @@ static void head_matvec_int8(const QT *t, const float *x, float *y) {
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
 
+// R2-07: aggregate PSRAM allocation cap prevents runaway allocations.
+#define PSRAM_ALLOC_CAP (24 * 1024 * 1024)  // 24 MB hard limit
+static size_t _ps_total = 0;
+
 static void *ps(size_t n) {
+  if (n > PSRAM_ALLOC_CAP || _ps_total + n > PSRAM_ALLOC_CAP) {
+    Serial.printf("PSRAM cap exceeded (%u + %u > %u)\n",
+                  (unsigned)_ps_total, (unsigned)n, (unsigned)PSRAM_ALLOC_CAP);
+    while (1) delay(1000);
+  }
   void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
   if (!p) { Serial.printf("PSRAM alloc failed (%u bytes)\n", (unsigned)n); while (1) delay(1000); }
+  _ps_total += n;
   return p;
 }
 
@@ -315,12 +325,29 @@ void setup() {
 #if USE_DISPLAY
   display_begin();
 #endif
+#if USE_CRYPTO
+  // R2-04: initialize crypto BEFORE espnow_begin so the RX callback
+  // never processes frames under an unprovisioned key.
+  crypto_init();
+  // R2-04: load SD-based PSK before enabling ESP-NOW callbacks.
+#if USE_SD
+  {
+    char psk_buf[64];
+    int psk_n = sd_read_file(SD_CFG "/psk.txt", psk_buf, sizeof(psk_buf));
+    if (psk_n > 0) {
+      while (psk_n > 0 && (psk_buf[psk_n-1] == '\n' || psk_buf[psk_n-1] == '\r'))
+        psk_buf[--psk_n] = '\0';
+      if (psk_n >= 16) {
+        crypto_set_psk(psk_buf);
+        Serial.println("[crypto] PSK loaded from SD");
+      }
+    }
+  }
+#endif
+#endif
 #if USE_ESPNOW
   if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
-#endif
 #if USE_CRYPTO
-  crypto_init();
-#if USE_ESPNOW
   espnow_set_crypto(crypto_sign, crypto_verify);
 #endif
 #endif
@@ -428,21 +455,7 @@ void setup() {
     }
   }
 #endif
-// S12: Load PSK from SD card if present.
-#if USE_SD && USE_CRYPTO
-  {
-    char psk_buf[64];
-    int psk_n = sd_read_file(SD_CFG "/psk.txt", psk_buf, sizeof(psk_buf));
-    if (psk_n > 0) {
-      while (psk_n > 0 && (psk_buf[psk_n-1] == '\n' || psk_buf[psk_n-1] == '\r'))
-        psk_buf[--psk_n] = '\0';
-      if (psk_n >= 16) {
-        crypto_set_psk(psk_buf);
-        Serial.println("[crypto] PSK loaded from SD");
-      }
-    }
-  }
-#endif
+// S12: PSK loaded from SD before ESP-NOW init (R2-04 boot ordering).
 // B5: Wire mesh relay into ESP-NOW broadcast path.
 #if USE_MESH
   espnow_set_relay(mesh_send);

@@ -58,12 +58,17 @@ static const PromptEntry PROMPTS[] = {
 };
 static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 
-// FR-02: sender-side replay table (4 slots, keyed by source MAC).
+// FR-02/R2-02: sender-side replay table with silence period and retired epochs.
 #define SENDER_REPLAY_SLOTS 4
+#define SENDER_EPOCH_SILENCE_MS 5000
+#define SENDER_RETIRED_EPOCHS 4
 static struct {
   uint8_t mac[6];
   uint32_t epoch;
+  uint32_t retired[SENDER_RETIRED_EPOCHS];
+  int retired_count;
   uint32_t last_seq;
+  unsigned long last_seen_ms;
   bool active;
 } _sender_replay[SENDER_REPLAY_SLOTS];
 
@@ -95,27 +100,52 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     verified_len = crypto_env_verify(_sender_psk, data, len, &ep, &sq);
     if (verified_len <= 0) return;
 
-    // Replay check keyed by source MAC.
+    // R2-02: replay check with silence period and retired epoch ring.
     int slot = -1, evict = 0;
+    unsigned long oldest = ULONG_MAX;
     for (int i = 0; i < SENDER_REPLAY_SLOTS; i++) {
       if (_sender_replay[i].active &&
           memcmp(_sender_replay[i].mac, info->src_addr, 6) == 0) {
         slot = i; break;
       }
-      if (!_sender_replay[i].active) evict = i;
+      if (!_sender_replay[i].active) { evict = i; oldest = 0; }
+      else if (_sender_replay[i].last_seen_ms < oldest) {
+        oldest = _sender_replay[i].last_seen_ms; evict = i;
+      }
     }
+    unsigned long now_ms = millis();
     if (slot >= 0) {
       if (ep == _sender_replay[slot].epoch) {
         if (sq <= _sender_replay[slot].last_seq) return;
         _sender_replay[slot].last_seq = sq;
       } else {
+        // Reject retired epochs.
+        for (int ri = 0; ri < _sender_replay[slot].retired_count; ri++) {
+          if (ep == _sender_replay[slot].retired[ri]) return;
+        }
+        // Require silence period before accepting new epoch.
+        if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_EPOCH_SILENCE_MS) return;
+        // Push current epoch into retired ring.
+        if (_sender_replay[slot].retired_count < SENDER_RETIRED_EPOCHS) {
+          _sender_replay[slot].retired[_sender_replay[slot].retired_count++] =
+              _sender_replay[slot].epoch;
+        } else {
+          memmove(_sender_replay[slot].retired, _sender_replay[slot].retired + 1,
+                  (SENDER_RETIRED_EPOCHS - 1) * sizeof(uint32_t));
+          _sender_replay[slot].retired[SENDER_RETIRED_EPOCHS - 1] =
+              _sender_replay[slot].epoch;
+        }
         _sender_replay[slot].epoch = ep;
         _sender_replay[slot].last_seq = sq;
       }
+      _sender_replay[slot].last_seen_ms = now_ms;
     } else {
       memcpy(_sender_replay[evict].mac, info->src_addr, 6);
       _sender_replay[evict].epoch = ep;
+      _sender_replay[evict].retired_count = 0;
+      memset(_sender_replay[evict].retired, 0, sizeof(_sender_replay[evict].retired));
       _sender_replay[evict].last_seq = sq;
+      _sender_replay[evict].last_seen_ms = now_ms;
       _sender_replay[evict].active = true;
     }
   }
@@ -185,8 +215,10 @@ void setup() {
 #if USE_CRYPTO
   _sender_epoch = esp_random();
   _sender_tx_seq = 0;
-  _otap_epoch = _sender_epoch;
-  _otap_tx_seq = 0;
+  // R2-03: share epoch and tx_seq with OTA path so both use a single
+  // monotonic counter per MAC+epoch pair.
+  _otap_epoch_ptr = &_sender_epoch;
+  _otap_tx_seq_ptr = &_sender_tx_seq;
   _otap_crypto_enabled = true;
   Serial.printf("[crypto] HMAC-SHA256 enabled (epoch=0x%08X)\n",
                 _sender_epoch);
