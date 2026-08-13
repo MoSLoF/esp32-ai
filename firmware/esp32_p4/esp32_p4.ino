@@ -14,6 +14,7 @@
 #include "esp_partition.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "pin_map.h"
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
 #include "../common/llm.h"
@@ -393,11 +394,54 @@ void setup() {
 #elif USE_DISPLAY
   display_persona("[-]", "p4-device", "ready");
 #endif
+// S10: NVS firmware version key for future migration paths.
+#if USE_PEER_PROTOCOL
+  {
+    #define NVS_FW_VERSION 1
+    uint8_t stored_ver = 0;
+    nvs_get_u8(_pr.nvs, "fwver", &stored_ver);
+    if (stored_ver < NVS_FW_VERSION) {
+      Serial.printf("[nvs] schema v%d -> v%d\n", stored_ver, NVS_FW_VERSION);
+      nvs_set_u8(_pr.nvs, "fwver", NVS_FW_VERSION);
+      nvs_commit(_pr.nvs);
+    }
+  }
+#endif
+// S12: Load PSK from SD card if present.
+#if USE_SD && USE_CRYPTO
+  {
+    char psk_buf[64];
+    int psk_n = sd_read_file(SD_CFG "/psk.txt", psk_buf, sizeof(psk_buf));
+    if (psk_n > 0) {
+      while (psk_n > 0 && (psk_buf[psk_n-1] == '\n' || psk_buf[psk_n-1] == '\r'))
+        psk_buf[--psk_n] = '\0';
+      if (psk_n >= 16) {
+        crypto_set_psk(psk_buf);
+        Serial.println("[crypto] PSK loaded from SD");
+      }
+    }
+  }
+#endif
+// B5: Wire mesh relay into ESP-NOW broadcast path.
+#if USE_MESH
+  espnow_set_relay(mesh_send);
+#endif
+// S5: Wire peer events to companion app.
+#if USE_COMPANION && USE_PEER_PROTOCOL
+  peer_on_event([](const char *event, const char *name, uint32_t id) {
+    companion_send_event(event, name, id);
+  });
+#endif
+// S8: Register companion prompt callback.
 #if USE_COMPANION
   companion_on_status(_comp_cb_status);
   companion_on_generate(_comp_cb_generate);
   companion_on_identity(_comp_cb_identity);
   companion_on_peers(_comp_cb_peers);
+  companion_on_prompt([](const char *text) {
+    Serial.printf("[companion] prompt: %s\n", text);
+    run_generate(PROMPT_IDS, sizeof(PROMPT_IDS) / sizeof(int), N_GENERATE);
+  });
 #endif
 }
 
@@ -467,7 +511,7 @@ void loop() {
 #endif
       if (cmd.startsWith("generate ")) {
         int v = cmd.substring(9).toInt();
-        if (v > 0) n_tok = v;
+        if (v > 0 && v <= 2000) n_tok = v;
       }
       run_generate(p_ids, p_n, n_tok);
     }

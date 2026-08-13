@@ -25,6 +25,7 @@
 
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_timer.h>
 #include <string.h>
 
 // Frame types.
@@ -37,6 +38,14 @@
 
 // Broadcast address (all peers).
 static const uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// RX rate limiting (V-07): cap frames per second to prevent flooding.
+#define ESPNOW_RX_LIMIT 100
+static uint32_t _espnow_rx_count = 0;
+static int64_t _espnow_rx_window = 0;
+
+// Prompt buffer spinlock for cross-core safety (V-09, V-15).
+static portMUX_TYPE _espnow_prompt_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Incoming prompt buffer (written by the RX callback, read by the main loop).
 static volatile uint16_t _espnow_prompt[ESPNOW_MAX_PROMPT];
@@ -70,23 +79,48 @@ static void espnow_set_crypto(espnow_sign_fn_t sign_fn,
   Serial.println("[espnow] crypto hooks registered");
 }
 
+// Mesh relay hook — set via espnow_set_relay() when USE_MESH is enabled (B5).
+typedef void (*espnow_relay_fn_t)(const uint8_t *frame, int len);
+static espnow_relay_fn_t _espnow_relay_fn = NULL;
+
+static void espnow_set_relay(espnow_relay_fn_t fn) {
+  _espnow_relay_fn = fn;
+  Serial.println("[espnow] relay hook registered");
+}
+
 // Send an extension frame (type >= 0x04) with crypto signing when enabled.
 // Caller's buffer must have room for 12 extra bytes (CRYPTO_OVERHEAD).
 static void espnow_send_secure(const uint8_t *dest, uint8_t *frame, int len) {
+  int raw_len = len;
   if (_espnow_sign_fn && len > 0 && frame[0] >= 0x04)
     len = _espnow_sign_fn(frame, len);
   esp_now_send(dest, frame, len);
+  // Relay broadcast extension frames via mesh (skip relay envelopes 0x10+).
+  if (_espnow_relay_fn && raw_len > 0
+      && frame[0] >= 0x04 && frame[0] < 0x10
+      && memcmp(dest, ESPNOW_BROADCAST, 6) == 0)
+    _espnow_relay_fn(frame, raw_len);
 }
 
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
+
+  // Rate limiting (V-07): cap frames per second.
+  int64_t now_us = esp_timer_get_time();
+  if (now_us - _espnow_rx_window > 1000000) {
+    _espnow_rx_count = 0;
+    _espnow_rx_window = now_us;
+  }
+  if (++_espnow_rx_count > ESPNOW_RX_LIMIT) return;
+
   uint8_t type = data[0];
 
   if (type == ESPNOW_MSG_PROMPT && len >= 3) {
     int n = data[1];
     if (n > ESPNOW_MAX_PROMPT) n = ESPNOW_MAX_PROMPT;
     if (len < 2 + n * 2) return;
+    portENTER_CRITICAL(&_espnow_prompt_mux);
     for (int i = 0; i < n; i++) {
       uint16_t id;
       memcpy(&id, data + 2 + i * 2, 2);
@@ -94,6 +128,7 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
     }
     _espnow_prompt_len = n;
     _espnow_prompt_ready = true;
+    portEXIT_CRITICAL(&_espnow_prompt_mux);
   }
   // ESPNOW_MSG_TEXT: tokenize on-device (would need the tokenizer on-chip,
   // not practical at this model size). Ignored for now.
@@ -138,13 +173,18 @@ static bool espnow_begin() {
 }
 
 // Check if a prompt arrived from a peer. Returns token count (0 = nothing).
-// Copies up to `max_ids` token IDs into `ids`. Clears the buffer.
+// Copies up to `max_ids` token IDs into `ids`. Clears the buffer atomically.
 static int espnow_poll_prompt(int *ids, int max_ids) {
-  if (!_espnow_prompt_ready) return 0;
+  portENTER_CRITICAL(&_espnow_prompt_mux);
+  if (!_espnow_prompt_ready) {
+    portEXIT_CRITICAL(&_espnow_prompt_mux);
+    return 0;
+  }
   int n = _espnow_prompt_len;
   if (n > max_ids) n = max_ids;
   for (int i = 0; i < n; i++) ids[i] = (int)_espnow_prompt[i];
   _espnow_prompt_ready = false;
+  portEXIT_CRITICAL(&_espnow_prompt_mux);
   return n;
 }
 
