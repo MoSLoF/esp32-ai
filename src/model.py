@@ -300,6 +300,8 @@ def make_model(arm, target_core, base: Config = None, verbose=True, fixed_ffn=No
                 best = trial
             else:
                 break
+        if best is None:
+            raise ValueError(f"bigcore: no d_model fits core budget {target_core + table_budget:,}")
         cfg = best
     else:
         lo, hi = 1, 64 * cfg.d_model

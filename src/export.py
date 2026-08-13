@@ -73,7 +73,7 @@ def quant_pack(w, group=GROUP):
 def main():
     tag = sys.argv[1] if len(sys.argv) > 1 else "ple-cleandeploy-s0"
     os.makedirs(OUT, exist_ok=True)
-    ck = torch.load(os.path.join(RUNS, f"{tag}.pt"), map_location="cpu", weights_only=False)
+    ck = torch.load(os.path.join(RUNS, f"{tag}.pt"), map_location="cpu", weights_only=True)
     cfg = Config(**ck["cfg"])
     model = TinyLM(cfg)
     model.load_state_dict(ck["state"])

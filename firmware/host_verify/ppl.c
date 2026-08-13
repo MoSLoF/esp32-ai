@@ -32,6 +32,10 @@ int main(int argc, char **argv) {
   s.ple = malloc(L*P*4); s.tmpP = malloc(L*P*4); s.trow = malloc(L*P*4);
   s.logits = malloc(V*4); s.scores = malloc(S*4);
   s.kcache = malloc((size_t)L*S*D*4); s.vcache = malloc((size_t)L*S*D*4);
+  if (!s.x || !s.h || !s.qkv || !s.att || !s.g1 || !s.g2 || !s.ple ||
+      !s.tmpP || !s.trow || !s.logits || !s.scores || !s.kcache || !s.vcache) {
+    fprintf(stderr, "scratch alloc failed\n"); return 1;
+  }
 
   size_t vn; uint16_t *val = (uint16_t *)read_file(valp, &vn);
   size_t n_tok = vn / 2;

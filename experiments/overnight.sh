@@ -18,8 +18,8 @@ run() { log "RUN $*"; uv run python src/train.py "$@" 2>&1 || log "!! FAILED: $*
 # vocab 4096, standard bs32/sl512 (~0.5-0.9 s/step as core grows). Single seed.
 log "=== JOB 1: corrected table-scaling sweep (fixed ffn=256, vocab 4096) ==="
 for pd in 64 128 256 512; do
-  run --arm ple         --fixed-ffn 256 --ple-dim $pd --steps 3000 --seed 0 --tag "fix-d$pd"
-  run --arm ple_notable --fixed-ffn 256 --ple-dim $pd --steps 3000 --seed 0 --tag "fix-d$pd"
+  run --arm ple         --fixed-ffn 256 --ple-dim "$pd" --steps 3000 --seed 0 --tag "fix-d$pd"
+  run --arm ple_notable --fixed-ffn 256 --ple-dim "$pd" --steps 3000 --seed 0 --tag "fix-d$pd"
 done
 
 # ---- Job 2: deployable-size validation @ vocab 32768 ---------------------------
@@ -29,12 +29,12 @@ done
 # Internally comparable (all vocab 32k); NOT comparable to the vocab-4096 runs.
 log "=== JOB 2: deploy validation @ vocab 32768 (bs16 sl256) ==="
 for arm in baseline ple fatembed; do
-  run --arm $arm --vocab 32768 --ple-dim 152 --target-core 590000 \
+  run --arm "$arm" --vocab 32768 --ple-dim 152 --target-core 590000 \
       --batch-size 16 --seq-len 256 --steps 5000 --seed 0 --tag "deploy590k"
 done
 # Reference point at the larger (SRAM-overflowing) core, if the night has room.
 for arm in baseline ple fatembed; do
-  run --arm $arm --vocab 32768 --ple-dim 152 --target-core 971000 \
+  run --arm "$arm" --vocab 32768 --ple-dim 152 --target-core 971000 \
       --batch-size 16 --seq-len 256 --steps 5000 --seed 0 --tag "deploy971k"
 done
 

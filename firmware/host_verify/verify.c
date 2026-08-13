@@ -35,14 +35,21 @@ int main(int argc, char **argv) {
   s.scores = malloc(S * 4);
   s.kcache = malloc((size_t)L * S * D * 4);
   s.vcache = malloc((size_t)L * S * D * 4);
+  if (!s.x || !s.h || !s.qkv || !s.att || !s.g1 || !s.g2 || !s.ple ||
+      !s.tmpP || !s.trow || !s.logits || !s.scores || !s.kcache || !s.vcache) {
+    fprintf(stderr, "scratch alloc failed\n"); return 1;
+  }
 
   // Golden prompt + reference logits from a simple text dump.
   FILE *gf = fopen(gold, "r");
   if (!gf) { perror(gold); return 1; }
   int plen; if (fscanf(gf, "%d", &plen) != 1) return 1;
+  if (plen <= 0 || plen > S) { fprintf(stderr, "bad prompt length %d\n", plen); return 1; }
   int *prompt = malloc(plen * sizeof(int));
+  if (!prompt) { fprintf(stderr, "malloc failed\n"); return 1; }
   for (int i = 0; i < plen; i++) if (fscanf(gf, "%d", &prompt[i]) != 1) return 1;
   float *ref = malloc(V * sizeof(float));
+  if (!ref) { fprintf(stderr, "malloc failed\n"); return 1; }
   for (int i = 0; i < V; i++) if (fscanf(gf, "%f", &ref[i]) != 1) return 1;
   fclose(gf);
 
