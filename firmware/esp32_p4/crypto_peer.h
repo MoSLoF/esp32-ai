@@ -27,9 +27,9 @@
 #define CRYPTO_OVERHEAD   CRYPTO_ENV_OVERHEAD
 
 // Pre-shared key — all devices in the flock share this.
-// Override at compile time with -DCRYPTO_PSK="..." for different flocks.
+// R2-04: no default PSK — must be provisioned at compile time or via SD.
 #ifndef CRYPTO_PSK
-#define CRYPTO_PSK "ple-tinylm-default-flock-key-v1"
+#error "CRYPTO_PSK must be defined — set via -DCRYPTO_PSK=\"...\" or load from SD card"
 #endif
 
 static const char *_crypto_psk = CRYPTO_PSK;
@@ -50,13 +50,17 @@ static uint32_t _crypto_epoch = 0;
 // Monotonic TX sequence counter.
 static uint32_t _crypto_tx_seq = 0;
 
-// FR-02: MAC-based replay tracking with epoch alternation prevention.
+// FR-02/R2-02: MAC-based replay tracking with bounded retired-epoch ring.
+// Tracks up to CRYPTO_RETIRED_EPOCHS previous epochs per sender to prevent
+// epoch cycling attacks (A→B→C→A where A's epoch would be accepted again).
 #define CRYPTO_REPLAY_SLOTS 16
 #define CRYPTO_EPOCH_SILENCE_US 5000000  // 5s silence before accepting new epoch
+#define CRYPTO_RETIRED_EPOCHS 4
 static struct {
   uint8_t mac[6];
   uint32_t epoch;
-  uint32_t prev_epoch;
+  uint32_t retired[CRYPTO_RETIRED_EPOCHS];
+  int retired_count;
   uint32_t last_seq;
   int64_t last_seen_us;
   bool active;
@@ -112,15 +116,26 @@ static int crypto_verify(const uint8_t *src_mac,
       if (seq <= _crypto_replay[slot].last_seq)
         return 0;
       _crypto_replay[slot].last_seq = seq;
-    } else if (epoch == _crypto_replay[slot].prev_epoch) {
-      // FR-02: reject previous epoch to prevent alternation attack.
-      return 0;
     } else {
+      // R2-02: reject any retired epoch to prevent cycling attacks.
+      for (int ri = 0; ri < _crypto_replay[slot].retired_count; ri++) {
+        if (epoch == _crypto_replay[slot].retired[ri])
+          return 0;
+      }
       // New epoch — require silence period before accepting.
       int64_t silence = now_us - _crypto_replay[slot].last_seen_us;
       if (silence < CRYPTO_EPOCH_SILENCE_US)
         return 0;
-      _crypto_replay[slot].prev_epoch = _crypto_replay[slot].epoch;
+      // Push current epoch into retired ring (FIFO, oldest dropped).
+      if (_crypto_replay[slot].retired_count < CRYPTO_RETIRED_EPOCHS) {
+        _crypto_replay[slot].retired[_crypto_replay[slot].retired_count++] =
+            _crypto_replay[slot].epoch;
+      } else {
+        memmove(_crypto_replay[slot].retired, _crypto_replay[slot].retired + 1,
+                (CRYPTO_RETIRED_EPOCHS - 1) * sizeof(uint32_t));
+        _crypto_replay[slot].retired[CRYPTO_RETIRED_EPOCHS - 1] =
+            _crypto_replay[slot].epoch;
+      }
       _crypto_replay[slot].epoch = epoch;
       _crypto_replay[slot].last_seq = seq;
     }
@@ -129,7 +144,8 @@ static int crypto_verify(const uint8_t *src_mac,
     // New MAC — evicted senders start fresh (no baseline advantage).
     memcpy(_crypto_replay[evict].mac, src_mac, 6);
     _crypto_replay[evict].epoch = epoch;
-    _crypto_replay[evict].prev_epoch = 0;
+    _crypto_replay[evict].retired_count = 0;
+    memset(_crypto_replay[evict].retired, 0, sizeof(_crypto_replay[evict].retired));
     _crypto_replay[evict].last_seq = seq;
     _crypto_replay[evict].last_seen_us = now_us;
     _crypto_replay[evict].active = true;

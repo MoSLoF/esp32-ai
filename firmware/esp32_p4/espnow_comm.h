@@ -173,25 +173,26 @@ static bool _espnow_authed_budget(int64_t now_us) {
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
 
-  // FR-06 two-tier rate limiting:
+  // FR-06/R2-07 two-tier rate limiting:
   // 1. Pre-auth global ceiling applies to ALL traffic.
-  // 2. If pre-auth budget is exhausted, authenticated frames still pass
-  //    via the reserved authenticated budget.
+  // 2. If pre-auth budget is exhausted, check if authenticated budget
+  //    has room BEFORE doing expensive HMAC verification.
   int64_t now_us = esp_timer_get_time();
   bool preauth_ok = _espnow_mac_ratelimit(info->src_addr, now_us);
 
   // EA-08: when crypto is enabled, verify ALL frame types.
   int verified_len = len;
   if (_espnow_verify_fn) {
+    // R2-07: when pre-auth budget is exhausted, check if authenticated
+    // budget has room BEFORE doing the expensive HMAC computation.
+    if (!preauth_ok && !_espnow_authed_budget(now_us)) {
+      _espnow_diag_preauth_drop++;
+      return;
+    }
     verified_len = _espnow_verify_fn(info->src_addr, data, len);
     if (verified_len <= 0) return;
-    // Authenticated frame — if pre-auth budget was exhausted, use reserved.
     if (!preauth_ok) {
-      if (_espnow_authed_budget(now_us)) {
-        _espnow_diag_authed_pass++;
-      } else {
-        return;
-      }
+      _espnow_diag_authed_pass++;
     }
   } else {
     if (!preauth_ok) {

@@ -141,9 +141,11 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
     break;
 
   case ESPNOW_MSG_OTA_DATA:
-    // FR-05: bind data to the accepted sender's MAC.
+    // FR-05/R2-05: bind data to the accepted sender's MAC and sender_id.
     if (len >= 8 && _ota.state == OTA_ACTIVE
         && memcmp(mac, _ota.sender_mac, 6) == 0) {
+      uint32_t data_sender_id; memcpy(&data_sender_id, d + 1, 4);
+      if (data_sender_id != _ota.sender_id) break;
       uint16_t seq; memcpy(&seq, d + 5, 2);
       uint8_t dlen = d[7];
       if (dlen > OTA_CHUNK_SIZE) dlen = OTA_CHUNK_SIZE;
@@ -227,9 +229,16 @@ static void ota_tick() {
         return;
       }
 
+      // R2-05: verify offer comes from the same sender that sent the manifest.
+      if (memcmp(_ota.sender_mac, _ota_offer_ring[rd].mac, 6) != 0) {
+        Serial.println("[ota] offer rejected: sender MAC differs from manifest sender");
+        __atomic_store_n(&_ota_offer_rd, (rd + 1) % OTA_RX_RING,
+                         __ATOMIC_RELEASE);
+        return;
+      }
+
       _ota.last_offer_time = now;
       _ota.sender_id = _ota_offer_ring[rd].id;
-      memcpy(_ota.sender_mac, _ota_offer_ring[rd].mac, 6);
       _ota.fw_size = offer_fw_size;
       _ota.n_chunks = _ota_offer_ring[rd].n_chunks;
       _ota.expected_crc = _ota_offer_ring[rd].crc;
@@ -345,13 +354,21 @@ static void ota_tick() {
                 _ota_tx_status(OTA_STATUS_ERROR);
                 _ota.state = OTA_IDLE;
               } else {
-                // FR-08: commit counter AFTER all finalization succeeds.
-                ota_verify_commit_counter();
-                _ota_tx_status(OTA_STATUS_COMPLETE);
-                Serial.println("[ota] update complete, rebooting in 2s...");
-                _ota.state = OTA_DONE;
-                delay(2000);
-                esp_restart();
+                // FR-08/R2-06: commit counter AFTER all finalization succeeds.
+                // Abort if counter persistence fails — rebooting with an
+                // uncommitted counter would allow rollback replay.
+                if (!ota_verify_commit_counter()) {
+                  Serial.println("[ota] counter commit failed, aborting update");
+                  _ota_tx_status(OTA_STATUS_ERROR);
+                  _ota.state = OTA_IDLE;
+                  ota_verify_reset();
+                } else {
+                  _ota_tx_status(OTA_STATUS_COMPLETE);
+                  Serial.println("[ota] update complete, rebooting in 2s...");
+                  _ota.state = OTA_DONE;
+                  delay(2000);
+                  esp_restart();
+                }
               }
             }
           }

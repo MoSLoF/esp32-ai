@@ -954,11 +954,15 @@ def test_fr02_mac_based_replay():
 
 
 def test_fr02_epoch_alternation_prevention():
-    """FR-02: Must prevent epoch alternation attacks."""
+    """FR-02/R2-02: Must prevent epoch alternation/cycling attacks."""
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
-    assert "prev_epoch" in crypto, (
-        "replay table must track previous epoch"
+    # R2-02: upgraded from prev_epoch to a bounded retired-epoch ring.
+    assert "retired" in crypto, (
+        "replay table must track retired epochs"
+    )
+    assert "CRYPTO_RETIRED_EPOCHS" in crypto, (
+        "must define retired epoch ring size"
     )
     assert "CRYPTO_EPOCH_SILENCE_US" in crypto, (
         "must have silence period before accepting new epoch"
@@ -1162,6 +1166,183 @@ def test_fr08_boot_partition_checked():
     boot_section = ota[boot_idx - 30:boot_idx + 100]
     assert "esp_err_t" in boot_section or "eb" in boot_section, (
         "esp_ota_set_boot_partition return value must be checked"
+    )
+
+
+# ---- R2 (Remediation Reassessment Round 2) tests ---------------------------
+
+def test_r2_01_stdbool_in_llm():
+    """R2-01: llm.h must include <stdbool.h> for C host builds."""
+    llm = (COMMON_DIR / "llm.h").read_text()
+    assert "#include <stdbool.h>" in llm, (
+        "llm.h must include <stdbool.h> for C portability"
+    )
+
+
+def test_r2_02_retired_epoch_ring():
+    """R2-02: crypto_peer.h must use a bounded retired-epoch ring."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "CRYPTO_RETIRED_EPOCHS" in crypto, (
+        "must define retired epoch ring size"
+    )
+    assert "retired_count" in crypto, (
+        "replay slot must track how many retired epochs are stored"
+    )
+    assert "memmove" in crypto, (
+        "retired ring must shift entries when full (FIFO eviction)"
+    )
+
+
+def test_r2_02_sender_epoch_silence():
+    """R2-02: Sender replay must require silence period for new epochs."""
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    assert "SENDER_EPOCH_SILENCE_MS" in sender, (
+        "sender must define epoch silence period"
+    )
+    assert "SENDER_RETIRED_EPOCHS" in sender, (
+        "sender must track retired epochs"
+    )
+
+
+def test_r2_03_unified_tx_counter():
+    """R2-03: Sender OTA path must share TX counter with prompt path."""
+    push = (SENDER_DIR / "ota_push.h").read_text()
+    assert "_otap_tx_seq_ptr" in push, (
+        "ota_push.h must use a shared TX seq pointer"
+    )
+    assert "_otap_epoch_ptr" in push, (
+        "ota_push.h must use a shared epoch pointer"
+    )
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    assert "_otap_tx_seq_ptr = &_sender_tx_seq" in sender, (
+        "sender setup must point OTA seq to shared counter"
+    )
+    assert "_otap_epoch_ptr = &_sender_epoch" in sender, (
+        "sender setup must point OTA epoch to shared epoch"
+    )
+
+
+def test_r2_04_no_default_psk():
+    """R2-04: crypto_peer.h and ota_push.h must not have a default PSK."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert '#error' in crypto, (
+        "crypto_peer.h must #error when CRYPTO_PSK is not defined"
+    )
+    assert '"ple-tinylm-default-flock-key-v1"' not in crypto or '#error' in crypto, (
+        "crypto_peer.h must not silently use a default PSK"
+    )
+    push = (SENDER_DIR / "ota_push.h").read_text()
+    assert '#error' in push, (
+        "ota_push.h must #error when CRYPTO_PSK is not defined"
+    )
+
+
+def test_r2_04_crypto_before_espnow():
+    """R2-04: crypto_init must happen before espnow_begin in boot."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    crypto_pos = ino.index("crypto_init()")
+    espnow_pos = ino.index("espnow_begin()")
+    assert crypto_pos < espnow_pos, (
+        "crypto_init() must be called before espnow_begin()"
+    )
+
+
+def test_r2_05_offer_mac_binding():
+    """R2-05: Offer processing must compare sender MAC to manifest sender."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    offer_section = ota[ota.index("offer_fw_size"):]
+    offer_section = offer_section[:offer_section.index("OTA_ACTIVE")]
+    assert "sender_mac" in offer_section and "offer_ring" in offer_section, (
+        "offer processing must verify sender MAC matches manifest sender"
+    )
+
+
+def test_r2_05_data_sender_id_check():
+    """R2-05: OTA data callback must verify payload sender_id."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    data_case = ota[ota.index("ESPNOW_MSG_OTA_DATA"):]
+    data_section = data_case[:data_case.index("break;")]
+    assert "data_sender_id" in data_section or "sender_id" in data_section, (
+        "OTA data handler must verify sender_id in payload"
+    )
+
+
+def test_r2_05_sender_status_mac_check():
+    """R2-05: Sender status drain must check source MAC."""
+    push = (SENDER_DIR / "ota_push.h").read_text()
+    assert "receiver_bound" in push, (
+        "sender must track receiver binding state"
+    )
+    assert "receiver_mac" in push, (
+        "sender must store bound receiver MAC"
+    )
+    status_section = push[push.lower().index("drain status ring"):]
+    assert "from_receiver" in status_section or "receiver_bound" in status_section, (
+        "sender status drain must check MAC of status sender"
+    )
+
+
+def test_r2_06_counter_commit_checked():
+    """R2-06: ota_verify_commit_counter return must be checked."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    # Find the commit_counter call and check its return is used.
+    commit_idx = ota.index("ota_verify_commit_counter()")
+    commit_context = ota[commit_idx - 10:commit_idx + 50]
+    assert "if" in commit_context or "!" in commit_context, (
+        "ota_verify_commit_counter() return must be checked with if"
+    )
+
+
+def test_r2_07_safe_bind_q_pointer():
+    """R2-07: bind_q must not use p + N > end (pointer overflow UB)."""
+    llm = (COMMON_DIR / "llm.h").read_text()
+    bind_q_start = llm.index("bind_q(")
+    bind_q = llm[bind_q_start:bind_q_start + 200]
+    assert "p + 4 > end" not in bind_q, (
+        "bind_q must not use p + 4 > end (use subtraction instead)"
+    )
+    assert "end - p" in bind_q, (
+        "bind_q must use (end - p) < 4 pattern"
+    )
+
+
+def test_r2_07_reject_zero_layers():
+    """R2-07: llm_load must reject L==0 (zero layers)."""
+    llm = (COMMON_DIR / "llm.h").read_text()
+    assert "L <= 0" in llm, (
+        "llm_load must reject L==0 (use <= not <)"
+    )
+
+
+def test_r2_07_psram_allocation_cap():
+    """R2-07: PSRAM allocations must have an aggregate cap."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "PSRAM_ALLOC_CAP" in ino, (
+        "must define an aggregate PSRAM allocation cap"
+    )
+    assert "_ps_total" in ino, (
+        "must track total PSRAM allocation"
+    )
+
+
+def test_r2_07_ratelimit_before_hmac():
+    """R2-07: Rate-limit drop must happen before expensive HMAC verification."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    rx_fn = en[en.index("_espnow_rx("):]
+    rx_fn = rx_fn[:rx_fn.index("\n}\n") + 3]
+    # The authed_budget check must come BEFORE _espnow_verify_fn call.
+    authed_check = rx_fn.index("_espnow_authed_budget")
+    verify_call = rx_fn.index("_espnow_verify_fn(")
+    assert authed_check < verify_call, (
+        "authenticated budget check must happen before HMAC verification"
     )
 
 
