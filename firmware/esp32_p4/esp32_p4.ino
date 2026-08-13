@@ -26,6 +26,13 @@
 #include "display.h"
 #endif
 
+// ESP-NOW: receive prompts from peers, broadcast generated tokens.
+// Requires WiFi (routed through the companion C6 via SDIO on the P4).
+#define USE_ESPNOW 0
+#if USE_ESPNOW
+#include "espnow_comm.h"
+#endif
+
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
 
@@ -37,6 +44,9 @@ static void emit(int tok) {
   if ((int)Serial.availableForWrite() >= len) Serial.write(bytes, len);
 #if USE_DISPLAY
   display_puts(bytes, len);
+#endif
+#if USE_ESPNOW
+  espnow_send_token(tok);
 #endif
 }
 
@@ -141,6 +151,9 @@ void setup() {
 #if USE_DISPLAY
   display_begin();
 #endif
+#if USE_ESPNOW
+  if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
+#endif
 
   // Cap head rows to the trained vocab BEFORE staging.
   model.tok_emb.rows = VOCAB_N;
@@ -173,15 +186,28 @@ void setup() {
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
 
   // ---- generate ----
-  Serial.print(">>> ");
+  // Use ESP-NOW prompt if one arrived, otherwise fall back to the hardcoded one.
+  int prompt_buf[128];
   int n_prompt = sizeof(PROMPT_IDS) / sizeof(int);
+  const int *prompt_ids = PROMPT_IDS;
+#if USE_ESPNOW
+  Serial.println("waiting for ESP-NOW prompt (or using default in 5s)...");
+  for (int w = 0; w < 50 && !_espnow_prompt_ready; w++) delay(100);
+  int espnow_n = espnow_poll_prompt(prompt_buf, 128);
+  if (espnow_n > 0) {
+    prompt_ids = prompt_buf;
+    n_prompt = espnow_n;
+    Serial.printf("received %d-token prompt via ESP-NOW\n", n_prompt);
+  }
+#endif
+  Serial.print(">>> ");
   int pos = 0, tok = 0;
   int64_t t_start = 0;
   int64_t decode_us = 0;
   int decoded = 0;
 
   for (int i = 0; i < n_prompt; i++) {
-    tok = PROMPT_IDS[i];
+    tok = prompt_ids[i];
     emit(tok);
     llm_forward(&model, tok, pos++, &s);
   }
