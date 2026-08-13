@@ -37,7 +37,10 @@ static const PromptEntry PROMPTS[] = {
 };
 static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 
-// RX callback: print tokens received from the P4.
+// Peer protocol frame type for passive scanning.
+#define ESPNOW_MSG_IDENTITY 0x04
+
+// RX callback: print tokens received from the P4, scan for peer beacons.
 static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
   if (data[0] == ESPNOW_MSG_TOKEN && len >= 3) {
@@ -48,6 +51,14 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
       int blen = VOCAB_OFF[tok + 1] - VOCAB_OFF[tok];
       Serial.write(bytes, blen);
     }
+  }
+  if (data[0] == ESPNOW_MSG_IDENTITY && len >= 13) {
+    uint32_t dev_id;
+    memcpy(&dev_id, data + 1, 4);
+    int nlen = len - 12;
+    if (nlen > 16) nlen = 16;
+    Serial.printf("\n[scan] peer: %.*s (0x%08X)\n",
+                  nlen, (const char *)(data + 12), dev_id);
   }
 }
 

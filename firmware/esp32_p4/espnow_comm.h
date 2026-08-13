@@ -43,6 +43,15 @@ static volatile uint16_t _espnow_prompt[ESPNOW_MAX_PROMPT];
 static volatile int _espnow_prompt_len = 0;
 static volatile bool _espnow_prompt_ready = false;
 
+// Extensible handler for peer protocol frames (0x04+).
+typedef void (*espnow_peer_handler_t)(const uint8_t *mac,
+                                       const uint8_t *data, int len);
+static espnow_peer_handler_t _espnow_peer_handler = NULL;
+
+static void espnow_register_peer_handler(espnow_peer_handler_t handler) {
+  _espnow_peer_handler = handler;
+}
+
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
@@ -62,6 +71,9 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
   }
   // ESPNOW_MSG_TEXT: tokenize on-device (would need the tokenizer on-chip,
   // not practical at this model size). Ignored for now.
+
+  if (type >= 0x04 && _espnow_peer_handler)
+    _espnow_peer_handler(info->src_addr, data, len);
 }
 
 // Initialize ESP-NOW. WiFi must be in STA mode (no AP needed).

@@ -29,8 +29,16 @@
 // ESP-NOW: receive prompts from peers, broadcast generated tokens.
 // Requires WiFi (routed through the companion C6 via SDIO on the P4).
 #define USE_ESPNOW 0
+#define USE_PEER_PROTOCOL 0
+#if USE_PEER_PROTOCOL && !USE_ESPNOW
+#undef USE_ESPNOW
+#define USE_ESPNOW 1
+#endif
 #if USE_ESPNOW
 #include "espnow_comm.h"
+#endif
+#if USE_PEER_PROTOCOL
+#include "peer_protocol.h"
 #endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
@@ -52,6 +60,23 @@ static void emit(int tok) {
 
 Model model;
 Scratch s;
+
+#if USE_PEER_PROTOCOL
+static int peer_infer(const int *prompt, int n_prompt, int n_gen, int *out) {
+  int pos = 0;
+  for (int i = 0; i < n_prompt; i++)
+    llm_forward(&model, prompt[i], pos++, &s);
+  int generated = 0;
+  for (int step = 0; step < n_gen && pos < model.c.seq_len; step++) {
+    int best = 0; float bv = -1e30f;
+    for (int v = 0; v < VOCAB_N; v++)
+      if (s.logits[v] > bv) { bv = s.logits[v]; best = v; }
+    out[generated++] = best;
+    llm_forward(&model, best, pos++, &s);
+  }
+  return generated;
+}
+#endif
 
 // ---- int8 output head (dual-core) ------------------------------------------
 // Same int8-staged approach as the S3 build. The P4's faster PSRAM (~200 MB/s
@@ -243,6 +268,22 @@ void setup() {
 #if USE_DISPLAY
   display_stats(decoded * 1e6f / decode_us, decode_us / 1000.0f / decoded);
 #endif
+
+#if USE_PEER_PROTOCOL
+  peer_init(peer_infer);
+#endif
 }
 
-void loop() { delay(10000); }
+void loop() {
+#if USE_PEER_PROTOCOL
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "status" || cmd == "peers") peer_print_status();
+  }
+  peer_tick();
+  delay(10);
+#else
+  delay(10000);
+#endif
+}
