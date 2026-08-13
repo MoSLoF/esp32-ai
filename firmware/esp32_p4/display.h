@@ -304,7 +304,23 @@ static bool display_begin() {
   esp_err_t err = esp_lcd_new_dsi_bus(&bus_cfg, &dsi_bus);
   if (err != ESP_OK) {
     Serial.printf("[display] DSI bus init failed: %d\n", err);
+    heap_caps_free(_disp_fb); _disp_fb = NULL;
     return false;
+  }
+
+  // DCS panel init via command-mode IO (S7: required for real ILI9881C panels).
+  esp_lcd_panel_io_handle_t dbi_io = NULL;
+  esp_lcd_dbi_io_config_t dbi_cfg = {};
+  dbi_cfg.virtual_channel = 0;
+  dbi_cfg.lcd_cmd_bits = 8;
+  dbi_cfg.lcd_param_bits = 8;
+  if (esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_cfg, &dbi_io) == ESP_OK && dbi_io) {
+    esp_lcd_panel_io_tx_param(dbi_io, 0x11, NULL, 0); // Sleep Out
+    delay(120);
+    esp_lcd_panel_io_tx_param(dbi_io, 0x29, NULL, 0); // Display On
+    delay(20);
+    esp_lcd_panel_io_del(dbi_io);
+    Serial.println("[display] DCS init sequence sent");
   }
 
   // DPI panel (video mode).
@@ -326,6 +342,7 @@ static bool display_begin() {
   err = esp_lcd_new_panel_dpi(dsi_bus, &dpi_cfg, &_disp_panel);
   if (err != ESP_OK) {
     Serial.printf("[display] DPI panel init failed: %d\n", err);
+    heap_caps_free(_disp_fb); _disp_fb = NULL;
     return false;
   }
   esp_lcd_panel_init(_disp_panel);

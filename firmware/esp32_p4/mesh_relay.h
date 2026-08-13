@@ -128,9 +128,11 @@ static void _mesh_espnow_handler(const uint8_t *mac,
   // Reject nested relay frames — inner payload must not be another relay.
   if (inner[0] == ESPNOW_MSG_RELAY) return;
 
+  // B6: espnow_comm.h must be included before this header (single-TU build).
+#ifndef ESPNOW_COMM_H
+#error "mesh_relay.h requires espnow_comm.h — include it first"
+#endif
   _mesh_dispatching = true;
-  extern espnow_peer_handler_t _espnow_ext[];
-  extern int _espnow_n_ext;
   for (int h = 0; h < _espnow_n_ext; h++)
     _espnow_ext[h](mac, inner, inner_len);
   _mesh_dispatching = false;

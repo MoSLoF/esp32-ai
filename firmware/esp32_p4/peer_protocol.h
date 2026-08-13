@@ -74,11 +74,20 @@ struct PeerSlot {
 };
 
 // ---- challenge prompt bank (identical on all peers) ------------------------
+// 12 entries (V-12): enough permutations to resist trivial replay.
 static const int CHALLENGE_BANK[][PEER_PROMPT_LEN] = {
   {433,  447,  259,  405},
   {1788, 539,  259,  464},
   {4189, 1039, 267,  539},
   {464,  433,  447,  259},
+  {259,  405,  433,  447},
+  {539,  1788, 405,  267},
+  {267,  4189, 464,  433},
+  {1039, 267,  539,  1788},
+  {405,  259,  1039, 267},
+  {447,  433,  1788, 4189},
+  {433,  1039, 447,  539},
+  {4189, 464,  259,  1039},
 };
 static const int N_CHAL_BANK =
     sizeof(CHALLENGE_BANK) / sizeof(CHALLENGE_BANK[0]);
@@ -109,24 +118,33 @@ static struct {
 
 static PeerSlot _pr_peers[PEER_MAX];
 
-// ---- incoming frame buffers (RX callback writes, tick reads) ---------------
-static volatile struct {
-  bool pending; uint32_t id; uint8_t mac[6];
-} _pri;
+// ---- peer event callback (S5: companion/external notification) -------------
+typedef void (*peer_event_fn_t)(const char *event, const char *peer_name,
+                                 uint32_t peer_id);
+static peer_event_fn_t _pr_event_fn = NULL;
 
-static volatile struct {
-  bool pending; uint32_t id; uint8_t mac[6];
+static void peer_on_event(peer_event_fn_t fn) { _pr_event_fn = fn; }
+
+// ---- SPSC ring buffers (B3: prevent dropped frames between ticks) ----------
+#define PEER_RX_RING 4
+
+static struct { uint32_t id; uint8_t mac[6]; } _pri_ring[PEER_RX_RING];
+static int _pri_wr = 0, _pri_rd = 0;
+
+static struct {
+  uint32_t id; uint8_t mac[6];
   uint16_t cid; int prompt[PEER_PROMPT_LEN]; int n; int n_exp;
-} _prc;
+} _prc_ring[PEER_RX_RING];
+static int _prc_wr = 0, _prc_rd = 0;
 
-static volatile struct {
-  bool pending; uint32_t id; uint16_t cid;
+static struct {
+  uint32_t id; uint16_t cid;
   int tokens[PEER_RESP_LEN]; int n;
-} _prr;
+} _prr_ring[PEER_RX_RING];
+static int _prr_wr = 0, _prr_rd = 0;
 
-static volatile struct {
-  bool pending; uint32_t id; uint16_t cid; bool pass;
-} _prv;
+static struct { uint32_t id; uint16_t cid; bool pass; } _prv_ring[PEER_RX_RING];
+static int _prv_wr = 0, _prv_rd = 0;
 
 // ---- utilities -------------------------------------------------------------
 
@@ -255,9 +273,13 @@ static void _pr_rx(const uint8_t *mac, const uint8_t *d, int len) {
   switch (type) {
   case ESPNOW_MSG_IDENTITY:
     if (len >= 12) {
-      _pri.id = sender;
-      memcpy((void *)_pri.mac, mac, 6);
-      _pri.pending = true;
+      int wr = __atomic_load_n(&_pri_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % PEER_RX_RING;
+      if (next != __atomic_load_n(&_pri_rd, __ATOMIC_ACQUIRE)) {
+        _pri_ring[wr].id = sender;
+        memcpy(_pri_ring[wr].mac, mac, 6);
+        __atomic_store_n(&_pri_wr, next, __ATOMIC_RELEASE);
+      }
     }
     break;
 
@@ -268,14 +290,18 @@ static void _pr_rx(const uint8_t *mac, const uint8_t *d, int len) {
       if (n > PEER_PROMPT_LEN) n = PEER_PROMPT_LEN;
       if (ne > PEER_RESP_LEN) ne = PEER_RESP_LEN;
       if (len < 9 + n * 2) break;
-      _prc.id = sender;
-      memcpy((void *)_prc.mac, mac, 6);
-      _prc.cid = ci; _prc.n = n; _prc.n_exp = ne;
-      for (int i = 0; i < n; i++) {
-        uint16_t t; memcpy(&t, d + 9 + i * 2, 2);
-        _prc.prompt[i] = (int)t;
+      int wr = __atomic_load_n(&_prc_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % PEER_RX_RING;
+      if (next != __atomic_load_n(&_prc_rd, __ATOMIC_ACQUIRE)) {
+        _prc_ring[wr].id = sender;
+        memcpy(_prc_ring[wr].mac, mac, 6);
+        _prc_ring[wr].cid = ci; _prc_ring[wr].n = n; _prc_ring[wr].n_exp = ne;
+        for (int i = 0; i < n; i++) {
+          uint16_t t; memcpy(&t, d + 9 + i * 2, 2);
+          _prc_ring[wr].prompt[i] = (int)t;
+        }
+        __atomic_store_n(&_prc_wr, next, __ATOMIC_RELEASE);
       }
-      _prc.pending = true;
     }
     break;
 
@@ -285,21 +311,29 @@ static void _pr_rx(const uint8_t *mac, const uint8_t *d, int len) {
       int n = d[7];
       if (n > PEER_RESP_LEN) n = PEER_RESP_LEN;
       if (len < 8 + n * 2) break;
-      _prr.id = sender; _prr.cid = ci; _prr.n = n;
-      for (int i = 0; i < n; i++) {
-        uint16_t t; memcpy(&t, d + 8 + i * 2, 2);
-        _prr.tokens[i] = (int)t;
+      int wr = __atomic_load_n(&_prr_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % PEER_RX_RING;
+      if (next != __atomic_load_n(&_prr_rd, __ATOMIC_ACQUIRE)) {
+        _prr_ring[wr].id = sender; _prr_ring[wr].cid = ci; _prr_ring[wr].n = n;
+        for (int i = 0; i < n; i++) {
+          uint16_t t; memcpy(&t, d + 8 + i * 2, 2);
+          _prr_ring[wr].tokens[i] = (int)t;
+        }
+        __atomic_store_n(&_prr_wr, next, __ATOMIC_RELEASE);
       }
-      _prr.pending = true;
     }
     break;
 
   case ESPNOW_MSG_VALIDATE:
     if (len >= 8) {
       uint16_t ci; memcpy(&ci, d + 5, 2);
-      _prv.id = sender; _prv.cid = ci;
-      _prv.pass = (d[7] != 0);
-      _prv.pending = true;
+      int wr = __atomic_load_n(&_prv_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % PEER_RX_RING;
+      if (next != __atomic_load_n(&_prv_rd, __ATOMIC_ACQUIRE)) {
+        _prv_ring[wr].id = sender; _prv_ring[wr].cid = ci;
+        _prv_ring[wr].pass = (d[7] != 0);
+        __atomic_store_n(&_prv_wr, next, __ATOMIC_RELEASE);
+      }
     }
     break;
   }
@@ -318,10 +352,10 @@ static void _pr_save() {
 static void peer_init(peer_infer_fn_t infer) {
   memset(&_pr, 0, sizeof(_pr));
   memset(_pr_peers, 0, sizeof(_pr_peers));
-  memset((void *)&_pri, 0, sizeof(_pri));
-  memset((void *)&_prc, 0, sizeof(_prc));
-  memset((void *)&_prr, 0, sizeof(_prr));
-  memset((void *)&_prv, 0, sizeof(_prv));
+  memset(_pri_ring, 0, sizeof(_pri_ring)); _pri_wr = _pri_rd = 0;
+  memset(_prc_ring, 0, sizeof(_prc_ring)); _prc_wr = _prc_rd = 0;
+  memset(_prr_ring, 0, sizeof(_prr_ring)); _prr_wr = _prr_rd = 0;
+  memset(_prv_ring, 0, sizeof(_prv_ring)); _prv_wr = _prv_rd = 0;
 
   _pr.infer = infer;
   _pr.next_cid = 1;
@@ -363,14 +397,19 @@ static void peer_tick() {
     _pr.last_beacon = now;
   }
 
-  // 2. Process identity beacon.
-  if (_pri.pending) {
-    uint32_t id = _pri.id;
+  // 2. Process identity beacons (drain ring buffer).
+  for (;;) {
+    int rd = __atomic_load_n(&_pri_rd, __ATOMIC_RELAXED);
+    if (rd == __atomic_load_n(&_pri_wr, __ATOMIC_ACQUIRE)) break;
+    uint32_t id = _pri_ring[rd].id;
+    uint8_t mac[6]; memcpy(mac, _pri_ring[rd].mac, 6);
+    __atomic_store_n(&_pri_rd, (rd + 1) % PEER_RX_RING, __ATOMIC_RELEASE);
+
     PeerSlot *p = _pr_find(id);
     if (!p) {
       p = _pr_alloc(id);
       if (p) {
-        memcpy(p->mac, (void *)_pri.mac, 6);
+        memcpy(p->mac, mac, 6);
         esp_now_peer_info_t pi = {};
         memcpy(pi.peer_addr, p->mac, 6);
         pi.channel = 0;
@@ -382,6 +421,7 @@ static void peer_tick() {
         Serial.printf("[!] discovered: %s (0x%08X)\n",
                       p->name, p->device_id);
         Serial.printf("    %s\n", persona()->quip_discover);
+        if (_pr_event_fn) _pr_event_fn("discovered", p->name, p->device_id);
 #if USE_SD
         sd_log_encounter(_pr.name, p->name, p->device_id, "DISCOVERED");
         sd_record_peer(p->name, p->device_id);
@@ -389,7 +429,6 @@ static void peer_tick() {
       }
     }
     if (p) p->last_seen = now;
-    _pri.pending = false;
   }
 
   // 3. Initiate challenge (one per tick to bound latency).
@@ -433,32 +472,44 @@ static void peer_tick() {
     break;
   }
 
-  // 4. Handle incoming challenge.
-  if (_prc.pending) {
-    PeerSlot *p = _pr_find(_prc.id);
-    if (p) {
-      Serial.printf("[<] challenge from %s, running inference...\n", p->name);
+  // 4. Handle incoming challenges (process one per tick to bound latency).
+  {
+    int rd = __atomic_load_n(&_prc_rd, __ATOMIC_RELAXED);
+    if (rd != __atomic_load_n(&_prc_wr, __ATOMIC_ACQUIRE)) {
+      uint32_t cid_sender = _prc_ring[rd].id;
       int prompt[PEER_PROMPT_LEN];
-      for (int i = 0; i < _prc.n; i++) prompt[i] = _prc.prompt[i];
-      int np = _prc.n, ne = _prc.n_exp;
-      uint16_t ci = _prc.cid;
+      for (int i = 0; i < _prc_ring[rd].n; i++) prompt[i] = _prc_ring[rd].prompt[i];
+      int np = _prc_ring[rd].n, ne = _prc_ring[rd].n_exp;
+      uint16_t ci = _prc_ring[rd].cid;
+      __atomic_store_n(&_prc_rd, (rd + 1) % PEER_RX_RING, __ATOMIC_RELEASE);
 
-      int resp[PEER_RESP_LEN];
-      int nr = _pr.infer(prompt, np, ne, resp);
-      _pr_tx_response(p->mac, ci, resp, nr);
-      Serial.printf("[>] sent %d-token response to %s\n", nr, p->name);
+      PeerSlot *p = _pr_find(cid_sender);
+      if (p) {
+        Serial.printf("[<] challenge from %s, running inference...\n", p->name);
+        int resp[PEER_RESP_LEN];
+        int nr = _pr.infer(prompt, np, ne, resp);
+        _pr_tx_response(p->mac, ci, resp, nr);
+        Serial.printf("[>] sent %d-token response to %s\n", nr, p->name);
+      }
     }
-    _prc.pending = false;
   }
 
-  // 5. Handle incoming response.
-  if (_prr.pending) {
-    PeerSlot *p = _pr_find(_prr.id);
-    if (p && p->challenge_sent && _prr.cid == p->challenge_id) {
+  // 5. Handle incoming responses (drain ring buffer).
+  for (;;) {
+    int rd = __atomic_load_n(&_prr_rd, __ATOMIC_RELAXED);
+    if (rd == __atomic_load_n(&_prr_wr, __ATOMIC_ACQUIRE)) break;
+    uint32_t resp_id = _prr_ring[rd].id;
+    uint16_t resp_cid = _prr_ring[rd].cid;
+    int resp_tokens[PEER_RESP_LEN]; int resp_n = _prr_ring[rd].n;
+    for (int i = 0; i < resp_n; i++) resp_tokens[i] = _prr_ring[rd].tokens[i];
+    __atomic_store_n(&_prr_rd, (rd + 1) % PEER_RX_RING, __ATOMIC_RELEASE);
+
+    PeerSlot *p = _pr_find(resp_id);
+    if (p && p->challenge_sent && resp_cid == p->challenge_id) {
       int match = 0;
-      int n = _prr.n < p->n_expected ? _prr.n : p->n_expected;
+      int n = resp_n < p->n_expected ? resp_n : p->n_expected;
       for (int i = 0; i < n; i++)
-        if (_prr.tokens[i] == p->expected[i]) match++;
+        if (resp_tokens[i] == p->expected[i]) match++;
 
       bool pass = (match == n && n > 0);
       _pr_tx_validate(p->mac, p->challenge_id, pass);
@@ -478,6 +529,7 @@ static void peer_tick() {
                         persona()->quip_bonded);
           Serial.printf("[**] BONDED with %s! (bond #%d)\n",
                         p->name, _pr.total_bonds);
+          if (_pr_event_fn) _pr_event_fn("bonded", p->name, p->device_id);
 #if USE_SD
           sd_log_bond(_pr.name, p->name, p->device_id, _pr.total_bonds);
 #endif
@@ -490,13 +542,19 @@ static void peer_tick() {
                       p->name, match, n);
       }
     }
-    _prr.pending = false;
   }
 
-  // 6. Handle incoming validation.
-  if (_prv.pending) {
-    PeerSlot *p = _pr_find(_prv.id);
-    if (p && _prv.pass) {
+  // 6. Handle incoming validations (drain ring buffer).
+  for (;;) {
+    int rd = __atomic_load_n(&_prv_rd, __ATOMIC_RELAXED);
+    if (rd == __atomic_load_n(&_prv_wr, __ATOMIC_ACQUIRE)) break;
+    uint32_t val_id = _prv_ring[rd].id;
+    uint16_t val_cid = _prv_ring[rd].cid;
+    bool val_pass = _prv_ring[rd].pass;
+    __atomic_store_n(&_prv_rd, (rd + 1) % PEER_RX_RING, __ATOMIC_RELEASE);
+
+    PeerSlot *p = _pr_find(val_id);
+    if (p && val_pass) {
       p->they_validated = true;
       Serial.printf("[*] %s validated us\n", p->name);
       if (p->i_validated && !p->bonded) {
@@ -508,6 +566,7 @@ static void peer_tick() {
                       persona()->quip_bonded);
         Serial.printf("[**] BONDED with %s! (bond #%d)\n",
                       p->name, _pr.total_bonds);
+        if (_pr_event_fn) _pr_event_fn("bonded", p->name, p->device_id);
 #if USE_SD
         sd_log_bond(_pr.name, p->name, p->device_id, _pr.total_bonds);
 #endif
@@ -517,7 +576,6 @@ static void peer_tick() {
                     persona()->quip_failed);
       Serial.printf("[x] %s rejected our response\n", p->name);
     }
-    _prv.pending = false;
   }
 
   // 7. Challenge timeout -> retry.

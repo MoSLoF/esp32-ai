@@ -431,6 +431,191 @@ def test_sd_without_peer_protocol():
     )
 
 
+def test_feature_flag_combos():
+    """Feature flag combinations must produce valid configurations (T1)."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+
+    # Key combo: USE_PEER_PROTOCOL implies USE_ESPNOW (auto-enable).
+    assert re.search(r'USE_PEER_PROTOCOL.*USE_ESPNOW', ino, re.S), (
+        "USE_PEER_PROTOCOL must trigger USE_ESPNOW auto-enable"
+    )
+
+    # USE_MESH implies USE_ESPNOW.
+    assert re.search(r'USE_MESH.*!USE_ESPNOW', ino, re.S), (
+        "USE_MESH must trigger USE_ESPNOW auto-enable"
+    )
+
+    # USE_CRYPTO + USE_ESPNOW must wire crypto hooks.
+    assert "espnow_set_crypto" in ino, "crypto must be wired to ESP-NOW"
+
+    # USE_MESH must wire relay hook.
+    assert "espnow_set_relay" in ino, (
+        "USE_MESH must wire mesh relay via espnow_set_relay"
+    )
+
+    # USE_SD + USE_CRYPTO must support PSK loading.
+    assert "crypto_set_psk" in ino or "psk.txt" in ino, (
+        "USE_SD + USE_CRYPTO should support SD-based PSK loading"
+    )
+
+    # USE_COMPANION + USE_PEER_PROTOCOL must wire peer events.
+    assert "peer_on_event" in ino, (
+        "USE_COMPANION + USE_PEER_PROTOCOL must wire peer event callback"
+    )
+
+
+def test_no_dead_event_functions():
+    """Functions designed for integration must have call sites (T2)."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+
+    # companion_send_event must be called (via peer_on_event or directly).
+    comp = read_file("companion_uart.h")
+    assert comp is not None
+    assert "companion_send_event" in comp, "companion_send_event must exist"
+    assert "companion_send_event" in ino or "peer_on_event" in ino, (
+        "companion_send_event must be wired to peer events in esp32_p4.ino"
+    )
+
+    # mesh_send must be wired (via espnow_set_relay or direct call).
+    mesh = read_file("mesh_relay.h")
+    assert mesh is not None
+    assert "mesh_send" in mesh, "mesh_send must exist"
+    assert "espnow_set_relay" in ino or "mesh_send" in ino, (
+        "mesh_send must be wired via espnow_set_relay in esp32_p4.ino"
+    )
+
+    # companion on_prompt callback must be registered.
+    assert "companion_on_prompt" in ino, (
+        "companion on_prompt callback must be registered in setup()"
+    )
+
+
+def test_nvs_version_key():
+    """Firmware must track NVS schema version for migrations (S10)."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "fwver" in ino or "NVS_FW_VERSION" in ino, (
+        "esp32_p4.ino must track NVS firmware version for migration"
+    )
+
+
+def test_pin_map_exists():
+    """A central pin map header must exist (S9)."""
+    pm = read_file("pin_map.h")
+    assert pm is not None, "pin_map.h not found"
+    assert "SD_PIN_CLK" in pm, "pin_map.h must define SD pin assignments"
+    assert "COMPANION_TX_PIN" in pm, "pin_map.h must define companion UART pins"
+
+
+def test_crypto_replay_per_sender():
+    """crypto_peer.h must use per-sender replay tracking (V-05)."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "CRYPTO_REPLAY_SLOTS" in crypto, (
+        "crypto_peer.h must have per-sender replay slot tracking"
+    )
+    assert "_crypto_tx_seq" in crypto, (
+        "crypto_peer.h must use monotonic TX sequence counter"
+    )
+
+
+def test_espnow_rate_limiting():
+    """espnow_comm.h must rate-limit RX callback (V-07)."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "ESPNOW_RX_LIMIT" in en, (
+        "espnow_comm.h must define ESPNOW_RX_LIMIT"
+    )
+    assert "_espnow_rx_count" in en, (
+        "espnow_comm.h must track RX frame count for rate limiting"
+    )
+
+
+def test_espnow_prompt_spinlock():
+    """espnow_comm.h must use a spinlock for prompt buffer (V-09, V-15)."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "portENTER_CRITICAL" in en, (
+        "espnow_comm.h must use portENTER_CRITICAL for prompt buffer"
+    )
+    assert "_espnow_prompt_mux" in en, (
+        "espnow_comm.h must have a spinlock for prompt buffer"
+    )
+
+
+def test_peer_ring_buffers():
+    """peer_protocol.h must use ring buffers for RX frames (B3)."""
+    pp = read_file("peer_protocol.h")
+    assert pp is not None
+    assert "PEER_RX_RING" in pp, (
+        "peer_protocol.h must define PEER_RX_RING for ring buffer size"
+    )
+    assert "_pri_ring" in pp, "identity ring buffer must exist"
+    assert "_prc_ring" in pp, "challenge ring buffer must exist"
+    assert "_prr_ring" in pp, "response ring buffer must exist"
+    assert "_prv_ring" in pp, "validate ring buffer must exist"
+
+
+def test_challenge_bank_size():
+    """Challenge bank must have >= 8 entries to resist replay (V-12)."""
+    pp = read_file("peer_protocol.h")
+    assert pp is not None
+    entries = re.findall(r'^\s*\{[\d,\s]+\}\s*,?\s*$', pp, re.M)
+    assert len(entries) >= 8, (
+        f"Challenge bank has {len(entries)} entries, need >= 8"
+    )
+
+
+def test_display_frees_fb_on_failure():
+    """display.h must free framebuffer on init failure (S6)."""
+    disp = read_file("display.h")
+    assert disp is not None
+    assert "heap_caps_free(_disp_fb)" in disp, (
+        "display_begin must free framebuffer on init failure"
+    )
+
+
+def test_display_dcs_init():
+    """display.h must send DCS init commands for real panels (S7)."""
+    disp = read_file("display.h")
+    assert disp is not None
+    assert "esp_lcd_panel_io_tx_param" in disp or "dbi_io" in disp, (
+        "display_begin must send DCS init commands (sleep out, display on)"
+    )
+
+
+def test_mesh_no_extern_linkage():
+    """mesh_relay.h must not use extern for single-TU statics (B6)."""
+    mesh = read_file("mesh_relay.h")
+    assert mesh is not None
+    assert "extern espnow_peer_handler_t" not in mesh, (
+        "mesh_relay.h should not use extern for espnow_comm.h statics"
+    )
+    assert "ESPNOW_COMM_H" in mesh, (
+        "mesh_relay.h must guard on ESPNOW_COMM_H being included first"
+    )
+
+
+def test_generate_bounds():
+    """Generate command must enforce token count bounds (S11)."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "2000" in ino or "v <= " in ino, (
+        "generate N command should cap token count"
+    )
+
+
+def test_crypto_psk_configurable():
+    """crypto_peer.h must support runtime PSK override (S12)."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "crypto_set_psk" in crypto, (
+        "crypto_peer.h must provide crypto_set_psk() for runtime PSK override"
+    )
+
+
 if __name__ == "__main__":
     # Run all test_* functions and report.
     tests = [(name, obj) for name, obj in sorted(globals().items())
