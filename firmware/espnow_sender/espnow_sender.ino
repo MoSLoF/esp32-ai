@@ -12,12 +12,17 @@
 
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 #include "../esp32_llm/vocab.h"   // shared token->text table for decoding RX
+#include "ota_push.h"
 
 #define ESPNOW_MSG_TOKEN  0x01
 #define ESPNOW_MSG_PROMPT 0x02
 
 static const uint8_t BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+#ifndef ESPNOW_BROADCAST
+#define ESPNOW_BROADCAST BROADCAST
+#endif
 
 // Hardcoded prompt token tables. In a full system you'd run a tokenizer
 // on-device or send raw text; for the demo, these cover common openers.
@@ -40,7 +45,8 @@ static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 // Peer protocol frame type for passive scanning.
 #define ESPNOW_MSG_IDENTITY 0x04
 
-// RX callback: print tokens received from the P4, scan for peer beacons.
+// RX callback: print tokens received from the P4, scan for peer beacons,
+// and dispatch OTA frames.
 static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
   if (data[0] == ESPNOW_MSG_TOKEN && len >= 3) {
@@ -60,6 +66,7 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     Serial.printf("\n[scan] peer: %.*s (0x%08X)\n",
                   nlen, (const char *)(data + 12), dev_id);
   }
+  _otap_rx(info, data, len);
 }
 
 static void send_prompt(const int *ids, int n) {
@@ -95,17 +102,34 @@ void setup() {
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
+  ota_push_init();
+
   Serial.println("ready. type a prompt (or number 1-4):");
   for (int i = 0; i < N_PROMPTS; i++)
     Serial.printf("  %d: \"%s\"\n", i + 1, PROMPTS[i].text);
   Serial.println("or type custom text (matched against known prompts)");
+  Serial.println("OTA commands: 'ota <size>' to upload, 'push' to broadcast");
 }
 
 void loop() {
+  ota_push_tick();
+
   if (!Serial.available()) return;
   String line = Serial.readStringUntil('\n');
   line.trim();
   if (line.length() == 0) return;
+
+  // OTA commands.
+  if (line.startsWith("ota ")) {
+    uint32_t size = (uint32_t)line.substring(4).toInt();
+    if (size > 0) ota_push_upload(size);
+    else Serial.println("usage: ota <size_bytes>");
+    return;
+  }
+  if (line == "push") {
+    ota_push_start();
+    return;
+  }
 
   // Check for numeric shortcut.
   if (line.length() == 1 && line[0] >= '1' && line[0] <= '0' + N_PROMPTS) {

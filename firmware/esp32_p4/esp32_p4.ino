@@ -30,7 +30,8 @@
 // Requires WiFi (routed through the companion C6 via SDIO on the P4).
 #define USE_ESPNOW 0
 #define USE_PEER_PROTOCOL 0
-#if USE_PEER_PROTOCOL && !USE_ESPNOW
+#define USE_OTA 0
+#if (USE_PEER_PROTOCOL || USE_OTA) && !USE_ESPNOW
 #undef USE_ESPNOW
 #define USE_ESPNOW 1
 #endif
@@ -39,6 +40,9 @@
 #endif
 #if USE_PEER_PROTOCOL
 #include "peer_protocol.h"
+#endif
+#if USE_OTA
+#include "ota_espnow.h"
 #endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
@@ -272,16 +276,26 @@ void setup() {
 #if USE_PEER_PROTOCOL
   peer_init(peer_infer);
 #endif
+#if USE_OTA
+  ota_init();
+#endif
 }
 
 void loop() {
-#if USE_PEER_PROTOCOL
+#if USE_PEER_PROTOCOL || USE_OTA
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
+#if USE_PEER_PROTOCOL
     if (cmd == "status" || cmd == "peers") peer_print_status();
+#endif
   }
+#if USE_PEER_PROTOCOL
   peer_tick();
+#endif
+#if USE_OTA
+  ota_tick();
+#endif
   delay(10);
 #else
   delay(10000);
