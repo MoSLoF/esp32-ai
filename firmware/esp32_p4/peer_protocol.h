@@ -167,7 +167,26 @@ static PeerSlot *_pr_alloc(uint32_t id) {
       return &_pr_peers[i];
     }
   }
-  return NULL;
+  // Evict the oldest non-bonded peer to make room.
+  int victim = -1;
+  int64_t oldest = INT64_MAX;
+  for (int i = 0; i < PEER_MAX; i++) {
+    if (_pr_peers[i].bonded) continue;
+    if (_pr_peers[i].last_seen < oldest) {
+      oldest = _pr_peers[i].last_seen;
+      victim = i;
+    }
+  }
+  if (victim < 0) return NULL;
+  Serial.printf("[peer] evicting %s (stale) for new peer\n",
+                _pr_peers[victim].name);
+  memset(&_pr_peers[victim], 0, sizeof(PeerSlot));
+  _pr_peers[victim].active = true;
+  _pr_peers[victim].device_id = id;
+  _pr_mkname(id, _pr_peers[victim].name);
+  _pr_peers[victim].first_seen = _pr_ms();
+  _pr_peers[victim].last_seen = _pr_ms();
+  return &_pr_peers[victim];
 }
 
 // ---- frame TX --------------------------------------------------------------
@@ -464,9 +483,10 @@ static void peer_tick() {
 #endif
         }
       } else {
+        p->challenge_sent = false;
         Serial.printf("  %s  %s\n", persona()->face_rejected,
                       persona()->quip_failed);
-        Serial.printf("[x] %s FAILED validation (%d/%d match)\n",
+        Serial.printf("[x] %s FAILED validation (%d/%d match), will retry\n",
                       p->name, match, n);
       }
     }

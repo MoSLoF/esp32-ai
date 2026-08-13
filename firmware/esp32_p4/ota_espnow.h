@@ -37,6 +37,7 @@
 #define OTA_CHUNK_SIZE      230
 #define OTA_REQ_TIMEOUT_MS  3000
 #define OTA_MAX_RETRIES     15
+#define OTA_OFFER_COOLDOWN  30000
 
 enum OtaRxState { OTA_IDLE, OTA_ACTIVE, OTA_DONE };
 
@@ -55,6 +56,7 @@ static struct {
   uint32_t crc;
   int64_t last_req;
   int retries;
+  int64_t last_offer_time;
   bool ready;
 } _ota;
 
@@ -151,8 +153,13 @@ static void ota_tick() {
   if (!_ota.ready) return;
   int64_t now = _ota_ms();
 
-  // Process OTA offer.
+  // Process OTA offer (with cooldown to prevent DoS via repeated offers).
   if (_ota_in_offer.pending && _ota.state == OTA_IDLE) {
+    if (now - _ota.last_offer_time < OTA_OFFER_COOLDOWN) {
+      _ota_in_offer.pending = false;
+      return;
+    }
+    _ota.last_offer_time = now;
     _ota.sender_id = _ota_in_offer.id;
     memcpy(_ota.sender_mac, (void *)_ota_in_offer.mac, 6);
     _ota.fw_size = _ota_in_offer.fw_size;

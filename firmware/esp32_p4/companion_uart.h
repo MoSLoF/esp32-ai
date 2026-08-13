@@ -83,11 +83,14 @@ static void companion_send_status(const char *name, const char *persona_name,
                                     int n_peers, int n_bonded,
                                     int encounters, int bonds) {
   if (!_comp.ready) return;
+  char esc_name[64], esc_persona[64];
+  _comp_esc(esc_name, sizeof(esc_name), name);
+  _comp_esc(esc_persona, sizeof(esc_persona), persona_name);
   char buf[COMP_BUF_SIZE];
   snprintf(buf, sizeof(buf),
     "{\"t\":\"status\",\"name\":\"%s\",\"persona\":\"%s\","
     "\"peers\":%d,\"bonded\":%d,\"encounters\":%d,\"bonds\":%d}\n",
-    name, persona_name, n_peers, n_bonded, encounters, bonds);
+    esc_name, esc_persona, n_peers, n_bonded, encounters, bonds);
   Serial1.print(buf);
 }
 
@@ -107,10 +110,13 @@ static void companion_send_token(const unsigned char *bytes, int len) {
 static void companion_send_event(const char *event, const char *peer_name,
                                    uint32_t peer_id) {
   if (!_comp.ready) return;
+  char esc_event[64], esc_peer[64];
+  _comp_esc(esc_event, sizeof(esc_event), event);
+  _comp_esc(esc_peer, sizeof(esc_peer), peer_name);
   char buf[COMP_BUF_SIZE];
   snprintf(buf, sizeof(buf),
     "{\"t\":\"event\",\"event\":\"%s\",\"peer\":\"%s\",\"id\":\"0x%08X\"}\n",
-    event, peer_name, peer_id);
+    esc_event, esc_peer, peer_id);
   Serial1.print(buf);
 }
 
@@ -127,11 +133,14 @@ static void companion_send_stats(float tok_s, float ms_tok,
 static void companion_send_peer(const char *name, uint32_t id,
                                   const char *state, int age_sec) {
   if (!_comp.ready) return;
+  char esc_name[64], esc_state[32];
+  _comp_esc(esc_name, sizeof(esc_name), name);
+  _comp_esc(esc_state, sizeof(esc_state), state);
   char buf[COMP_BUF_SIZE];
   snprintf(buf, sizeof(buf),
     "{\"t\":\"peer\",\"name\":\"%s\",\"id\":\"0x%08X\","
     "\"state\":\"%s\",\"age\":%d}\n",
-    name, id, state, age_sec);
+    esc_name, id, esc_state, age_sec);
   Serial1.print(buf);
 }
 

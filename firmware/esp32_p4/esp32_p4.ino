@@ -433,11 +433,16 @@ void loop() {
     }
 #endif
     else if (cmd.startsWith("cat ")) {
-      char buf[1024];
-      String path = String(SD_MOUNT_POINT "/") + cmd.substring(4);
-      int n = sd_read_file(path.c_str(), buf, sizeof(buf));
-      if (n > 0) Serial.println(buf);
-      else Serial.println("[sd] file not found or empty");
+      String sub = cmd.substring(4);
+      if (sub.indexOf("..") >= 0) {
+        Serial.println("[sd] path traversal rejected");
+      } else {
+        char buf[1024];
+        String path = String(SD_MOUNT_POINT "/") + sub;
+        int n = sd_read_file(path.c_str(), buf, sizeof(buf));
+        if (n > 0) Serial.println(buf);
+        else Serial.println("[sd] file not found or empty");
+      }
     } else
 #endif
     // SD-loaded prompts: "generate" picks a random SD prompt, "generate N"

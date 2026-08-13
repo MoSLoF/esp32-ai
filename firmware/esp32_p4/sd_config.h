@@ -92,6 +92,7 @@ static void sd_provision(uint32_t device_id, const char *device_name,
   }
 
   // config/challenges.txt — write the compiled-in challenge bank.
+#ifdef PEER_PROTOCOL_H
   {
     FILE *f = fopen(SD_CFG "/challenges.txt", "w");
     if (f) {
@@ -105,6 +106,7 @@ static void sd_provision(uint32_t device_id, const char *device_name,
       fclose(f);
     }
   }
+#endif
 
   // config/peers.txt — empty, populated as peers are discovered.
   if (!sd_exists(SD_CFG "/peers.txt"))
@@ -143,8 +145,13 @@ static int sd_load_identity() {
   int n = sd_read_file(SD_CFG "/identity.txt", buf, sizeof(buf));
   if (n <= 0) return -1;
   int idx = atoi(buf);
+#ifdef PEER_IDENTITY_H
   if (idx < 0 || idx >= N_PERSONAS) return -1;
   Serial.printf("[sd] persona: %d (%s)\n", idx, PERSONAS[idx].name);
+#else
+  if (idx < 0) return -1;
+  Serial.printf("[sd] persona: %d\n", idx);
+#endif
   return idx;
 }
 
@@ -246,21 +253,40 @@ static const int *sd_challenge(int i, int *len) {
 
 // ---- encounter & bond logging -----------------------------------------------
 
+// Strip leading characters that trigger formula injection in spreadsheets.
+static void _sd_sanitize_csv(char *dst, int max, const char *src) {
+  int i = 0;
+  const char *p = src;
+  while (*p && (*p == '=' || *p == '+' || *p == '-' || *p == '@')) p++;
+  if (!*p) p = src;
+  while (*p && i < max - 1) {
+    if (*p == ',' || *p == '\n' || *p == '\r') { p++; continue; }
+    dst[i++] = *p++;
+  }
+  dst[i] = '\0';
+}
+
 static bool sd_log_encounter(const char *our_name, const char *peer_name,
                               uint32_t peer_id, const char *event) {
   if (!sd_mounted()) return false;
+  char safe_name[32], safe_peer[32];
+  _sd_sanitize_csv(safe_name, sizeof(safe_name), our_name);
+  _sd_sanitize_csv(safe_peer, sizeof(safe_peer), peer_name);
   char line[SD_LINE_MAX];
   snprintf(line, sizeof(line), "%lu,%s,%s,0x%08X,%s",
-           millis(), our_name, peer_name, peer_id, event);
+           millis(), safe_name, safe_peer, peer_id, event);
   return sd_append_line(SD_LOG "/encounters.log", line);
 }
 
 static bool sd_log_bond(const char *our_name, const char *peer_name,
                           uint32_t peer_id, int bond_num) {
   if (!sd_mounted()) return false;
+  char safe_name[32], safe_peer[32];
+  _sd_sanitize_csv(safe_name, sizeof(safe_name), our_name);
+  _sd_sanitize_csv(safe_peer, sizeof(safe_peer), peer_name);
   char line[SD_LINE_MAX];
   snprintf(line, sizeof(line), "%lu,%s,%s,0x%08X,%d",
-           millis(), our_name, peer_name, peer_id, bond_num);
+           millis(), safe_name, safe_peer, peer_id, bond_num);
   sd_append_line(SD_LOG "/bonds.log", line);
   char evt[32];
   snprintf(evt, sizeof(evt), "BONDED,#%d", bond_num);
@@ -278,8 +304,10 @@ static void sd_record_peer(const char *peer_name, uint32_t peer_id) {
   int n = sd_read_file(SD_CFG "/peers.txt", buf, sizeof(buf));
   if (n > 0 && strstr(buf, id_str)) return;
 
+  char safe_peer[32];
+  _sd_sanitize_csv(safe_peer, sizeof(safe_peer), peer_name);
   char line[SD_LINE_MAX];
-  snprintf(line, sizeof(line), "%s,0x%08X,%lu", peer_name, peer_id, millis());
+  snprintf(line, sizeof(line), "%s,0x%08X,%lu", safe_peer, peer_id, millis());
   sd_append_line(SD_CFG "/peers.txt", line);
 }
 
@@ -333,7 +361,9 @@ static void sd_setup(uint32_t device_id, const char *device_name,
 
   // Load config (reads back what provisioning wrote, or user edits).
   int idx = sd_load_identity();
+#ifdef PEER_IDENTITY_H
   if (idx >= 0) persona_select(idx);
+#endif
   sd_load_prompts();
   sd_load_challenges();
   sd_list_dir(SD_CFG);
