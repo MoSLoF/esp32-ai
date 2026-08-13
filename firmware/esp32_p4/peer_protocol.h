@@ -67,6 +67,8 @@ struct PeerSlot {
   uint16_t challenge_id;
   int expected[PEER_RESP_LEN];
   int n_expected;
+  uint16_t inbound_cid;
+  bool inbound_responded;
   int64_t first_seen;
   int64_t last_seen;
   int64_t challenge_time;
@@ -489,6 +491,8 @@ static void peer_tick() {
         int resp[PEER_RESP_LEN];
         int nr = _pr.infer(prompt, np, ne, resp);
         _pr_tx_response(p->mac, ci, resp, nr);
+        p->inbound_cid = ci;
+        p->inbound_responded = true;
         Serial.printf("[>] sent %d-token response to %s\n", nr, p->name);
       }
     }
@@ -506,12 +510,12 @@ static void peer_tick() {
 
     PeerSlot *p = _pr_find(resp_id);
     if (p && p->challenge_sent && resp_cid == p->challenge_id) {
+      // EA-02: require exact response length before comparing tokens.
+      bool pass = (resp_n == p->n_expected && resp_n > 0);
       int match = 0;
-      int n = resp_n < p->n_expected ? resp_n : p->n_expected;
-      for (int i = 0; i < n; i++)
-        if (resp_tokens[i] == p->expected[i]) match++;
-
-      bool pass = (match == n && n > 0);
+      for (int i = 0; i < p->n_expected; i++)
+        if (i < resp_n && resp_tokens[i] == p->expected[i]) match++;
+      pass = pass && (match == p->n_expected);
       _pr_tx_validate(p->mac, p->challenge_id, pass);
 
       if (pass) {
@@ -519,7 +523,7 @@ static void peer_tick() {
         Serial.printf("  %s  %s\n", persona()->face_found,
                       persona()->quip_verified);
         Serial.printf("[*] %s VERIFIED (%d/%d tokens match)\n",
-                      p->name, match, n);
+                      p->name, match, p->n_expected);
         if (p->they_validated && !p->bonded) {
           p->bonded = true;
           p->bond_count++;
@@ -538,8 +542,8 @@ static void peer_tick() {
         p->challenge_sent = false;
         Serial.printf("  %s  %s\n", persona()->face_rejected,
                       persona()->quip_failed);
-        Serial.printf("[x] %s FAILED validation (%d/%d match), will retry\n",
-                      p->name, match, n);
+        Serial.printf("[x] %s FAILED validation (%d/%d match, got %d expected %d), will retry\n",
+                      p->name, match, p->n_expected, resp_n, p->n_expected);
       }
     }
   }
@@ -554,9 +558,11 @@ static void peer_tick() {
     __atomic_store_n(&_prv_rd, (rd + 1) % PEER_RX_RING, __ATOMIC_RELEASE);
 
     PeerSlot *p = _pr_find(val_id);
-    if (p && val_pass) {
+    // EA-03: accept VALIDATE only when CID matches our inbound challenge.
+    if (p && val_pass && p->inbound_responded && val_cid == p->inbound_cid) {
+      p->inbound_responded = false;
       p->they_validated = true;
-      Serial.printf("[*] %s validated us\n", p->name);
+      Serial.printf("[*] %s validated us (cid=%d)\n", p->name, val_cid);
       if (p->i_validated && !p->bonded) {
         p->bonded = true;
         p->bond_count++;

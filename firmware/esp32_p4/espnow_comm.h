@@ -39,10 +39,19 @@
 // Broadcast address (all peers).
 static const uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// RX rate limiting (V-07): cap frames per second to prevent flooding.
-#define ESPNOW_RX_LIMIT 100
-static uint32_t _espnow_rx_count = 0;
-static int64_t _espnow_rx_window = 0;
+// Per-MAC rate limiting (EA-07): separate pre-auth and post-auth buckets.
+#define ESPNOW_RX_LIMIT       100
+#define ESPNOW_RX_MAC_SLOTS   8
+#define ESPNOW_RX_GLOBAL_CEIL 500
+
+static struct {
+  uint8_t mac[6];
+  uint16_t count;
+  int64_t window;
+  bool active;
+} _espnow_rx_mac[ESPNOW_RX_MAC_SLOTS];
+static uint32_t _espnow_rx_global = 0;
+static int64_t _espnow_rx_global_window = 0;
 
 // Prompt buffer spinlock for cross-core safety (V-09, V-15).
 static portMUX_TYPE _espnow_prompt_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -88,11 +97,11 @@ static void espnow_set_relay(espnow_relay_fn_t fn) {
   Serial.println("[espnow] relay hook registered");
 }
 
-// Send an extension frame (type >= 0x04) with crypto signing when enabled.
-// Caller's buffer must have room for 12 extra bytes (CRYPTO_OVERHEAD).
+// Send a frame with crypto signing when enabled (EA-08: all frame types).
+// Caller's buffer must have room for 16 extra bytes (CRYPTO_ENV_OVERHEAD).
 static void espnow_send_secure(const uint8_t *dest, uint8_t *frame, int len) {
   int raw_len = len;
-  if (_espnow_sign_fn && len > 0 && frame[0] >= 0x04)
+  if (_espnow_sign_fn && len > 0)
     len = _espnow_sign_fn(frame, len);
   esp_now_send(dest, frame, len);
   // Relay broadcast extension frames via mesh (skip relay envelopes 0x10+).
@@ -102,24 +111,65 @@ static void espnow_send_secure(const uint8_t *dest, uint8_t *frame, int len) {
     _espnow_relay_fn(frame, raw_len);
 }
 
+// EA-07: per-source-MAC rate check. Returns true if this MAC is within budget.
+static bool _espnow_mac_ratelimit(const uint8_t *mac, int64_t now_us) {
+  // Global emergency ceiling — bounds MAC rotation attacks.
+  if (now_us - _espnow_rx_global_window > 1000000) {
+    _espnow_rx_global = 0;
+    _espnow_rx_global_window = now_us;
+  }
+  if (++_espnow_rx_global > ESPNOW_RX_GLOBAL_CEIL) return false;
+
+  // Per-MAC bucket lookup.
+  int slot = -1, evict = 0;
+  int64_t oldest = INT64_MAX;
+  for (int i = 0; i < ESPNOW_RX_MAC_SLOTS; i++) {
+    if (_espnow_rx_mac[i].active && memcmp(_espnow_rx_mac[i].mac, mac, 6) == 0) {
+      slot = i; break;
+    }
+    if (!_espnow_rx_mac[i].active) { evict = i; oldest = 0; }
+    else if (_espnow_rx_mac[i].window < oldest) {
+      oldest = _espnow_rx_mac[i].window; evict = i;
+    }
+  }
+
+  if (slot >= 0) {
+    if (now_us - _espnow_rx_mac[slot].window > 1000000) {
+      _espnow_rx_mac[slot].count = 0;
+      _espnow_rx_mac[slot].window = now_us;
+    }
+    return (++_espnow_rx_mac[slot].count <= ESPNOW_RX_LIMIT);
+  }
+
+  // New MAC — allocate or evict.
+  _espnow_rx_mac[evict].active = true;
+  memcpy(_espnow_rx_mac[evict].mac, mac, 6);
+  _espnow_rx_mac[evict].count = 1;
+  _espnow_rx_mac[evict].window = now_us;
+  return true;
+}
+
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
 
-  // Rate limiting (V-07): cap frames per second.
+  // EA-07: per-source-MAC rate limiting.
   int64_t now_us = esp_timer_get_time();
-  if (now_us - _espnow_rx_window > 1000000) {
-    _espnow_rx_count = 0;
-    _espnow_rx_window = now_us;
+  if (!_espnow_mac_ratelimit(info->src_addr, now_us)) return;
+
+  // EA-08: when crypto is enabled, verify ALL frame types.
+  int verified_len = len;
+  if (_espnow_verify_fn) {
+    verified_len = _espnow_verify_fn(data, len);
+    if (verified_len <= 0) return;
   }
-  if (++_espnow_rx_count > ESPNOW_RX_LIMIT) return;
 
   uint8_t type = data[0];
 
-  if (type == ESPNOW_MSG_PROMPT && len >= 3) {
+  if (type == ESPNOW_MSG_PROMPT && verified_len >= 3) {
     int n = data[1];
     if (n > ESPNOW_MAX_PROMPT) n = ESPNOW_MAX_PROMPT;
-    if (len < 2 + n * 2) return;
+    if (verified_len < 2 + n * 2) return;
     portENTER_CRITICAL(&_espnow_prompt_mux);
     for (int i = 0; i < n; i++) {
       uint16_t id;
@@ -130,17 +180,10 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
     _espnow_prompt_ready = true;
     portEXIT_CRITICAL(&_espnow_prompt_mux);
   }
-  // ESPNOW_MSG_TEXT: tokenize on-device (would need the tokenizer on-chip,
-  // not practical at this model size). Ignored for now.
 
   if (type >= 0x04) {
-    int ext_len = len;
-    if (_espnow_verify_fn) {
-      ext_len = _espnow_verify_fn(data, len);
-      if (ext_len <= 0) return;
-    }
     for (int _h = 0; _h < _espnow_n_ext; _h++)
-      _espnow_ext[_h](info->src_addr, data, ext_len);
+      _espnow_ext[_h](info->src_addr, data, verified_len);
   }
 }
 
@@ -168,6 +211,8 @@ static bool espnow_begin() {
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
+  memset(_espnow_rx_mac, 0, sizeof(_espnow_rx_mac));
+
   Serial.println("ESP-NOW ready (broadcast)");
   return true;
 }
@@ -188,23 +233,23 @@ static int espnow_poll_prompt(int *ids, int max_ids) {
   return n;
 }
 
-// Broadcast a generated token to all peers.
+// Broadcast a generated token to all peers (EA-08: uses authenticated send).
 static void espnow_send_token(int token_id) {
-  uint8_t frame[3];
+  uint8_t frame[3 + 16];
   frame[0] = ESPNOW_MSG_TOKEN;
   uint16_t id = (uint16_t)token_id;
   memcpy(frame + 1, &id, 2);
-  esp_now_send(ESPNOW_BROADCAST, frame, sizeof(frame));
+  espnow_send_secure(ESPNOW_BROADCAST, frame, 3);
 }
 
-// Broadcast raw UTF-8 bytes (e.g., decoded token text for display peers).
+// Broadcast raw UTF-8 bytes (EA-08: uses authenticated send).
 static void espnow_send_text(const uint8_t *text, int len) {
-  if (len > 248) len = 248;  // ESP-NOW max payload = 250, minus 2-byte header
+  if (len > 232) len = 232;  // ESP-NOW 250 - 2B header - 16B crypto
   uint8_t frame[250];
   frame[0] = ESPNOW_MSG_TEXT;
   frame[1] = (uint8_t)len;
   memcpy(frame + 2, text, len);
-  esp_now_send(ESPNOW_BROADCAST, frame, 2 + len);
+  espnow_send_secure(ESPNOW_BROADCAST, frame, 2 + len);
 }
 
 #endif

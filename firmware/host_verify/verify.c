@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
   size_t n;
   uint8_t *buf = read_file(bin, &n);
   Model m;
-  if (llm_load(buf, &m)) { fprintf(stderr, "bad magic\n"); return 1; }
+  if (llm_load(buf, n, &m)) { fprintf(stderr, "bad model\n"); return 1; }
   printf("loaded: V=%d D=%d L=%d H=%d F=%d P=%d group=%d  (%.2f MB)\n",
          m.c.vocab, m.c.dim, m.c.n_layers, m.c.n_heads, m.c.ffn, m.c.ple_dim,
          m.c.group, n / 1e6);
