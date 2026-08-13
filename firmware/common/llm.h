@@ -75,6 +75,8 @@ static const uint8_t *bind_q(const uint8_t *p, QT *t, int rows, int cols) {
   t->n_groups = (cols + group - 1) / group;
   t->row_bytes = (cols + 1) / 2;
   t->codes = p;  p += (size_t)rows * t->row_bytes;
+  // Ensure 2-byte alignment for scales (Xtensa traps on misaligned loads).
+  if ((uintptr_t)p & 1) p++;
   t->scales = (const uint16_t *)p;  p += (size_t)rows * t->n_groups * 2;
   return p;
 }
@@ -191,7 +193,8 @@ static void matvec_q8_range(const QT *t, const int8_t *xq, float x_scale,
 }
 
 static void matvec_q8(const QT *t, const float *x, float *y) {
-  static int8_t xq[1024];  // max input dim across the model is 128
+  static int8_t xq[1024];
+  if (t->cols > 1024) return;
   float xs;
   quantize_act(x, t->cols, xq, &xs);
   matvec_q8_range(t, xq, xs, y, 0, t->rows);
@@ -221,6 +224,7 @@ static int llm_load(const uint8_t *base, Model *m) {
   int32_t hv[8]; memcpy(hv, p, 32); p += 32;
   m->c.vocab = hv[0]; m->c.dim = hv[1]; m->c.n_layers = hv[2]; m->c.n_heads = hv[3];
   m->c.ffn = hv[4]; m->c.ple_dim = hv[5]; m->c.seq_len = hv[6]; m->c.group = hv[7];
+  if (m->c.n_layers < 0 || m->c.n_layers > 32) return -1;
   memcpy(&m->c.rope_theta, p, 4); p += 4;
   m->head_matvec = NULL;
   int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn, V = m->c.vocab;
@@ -268,6 +272,8 @@ static void llm_profile_reset(Scratch *s) {
 static void llm_forward(Model *m, int token, int pos, Scratch *s) {
   int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn;
   int H = m->c.n_heads, Dh = D / H, S = m->c.seq_len;
+  if (token < 0 || token >= m->c.vocab) return;
+  if (pos < 0 || pos >= S) return;
 #ifdef LLM_PROFILE
   uint64_t profile_t0 = (uint64_t)LLM_PROFILE_NOW();
 #endif

@@ -105,7 +105,8 @@ def main():
     train_b = Batcher("train", args.batch_size, args.seq_len, device, suffix)
     val_b = Batcher("val", args.batch_size, args.seq_len, device, suffix)
 
-    name = f"{args.arm}{'-' + args.tag if args.tag else ''}-s{args.seed}"
+    tag = args.tag.replace("/", "_").replace("..", "_")
+    name = f"{args.arm}{'-' + tag if tag else ''}-s{args.seed}"
     history, best = [], float("inf")
     t0 = time.time()
 

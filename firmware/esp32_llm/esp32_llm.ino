@@ -153,7 +153,7 @@ void setup() {
   model.tok_emb.rows = VOCAB_N;
   stage_head_int8(&model.tok_emb);  // int8-staged head; input embedding still uses mmap
   inference_task = xTaskGetCurrentTaskHandle();
-  if (xTaskCreatePinnedToCore(head_worker_main, "head", 4096, NULL, 2,
+  if (xTaskCreatePinnedToCore(head_worker_main, "head", 8192, NULL, 2,
                              &head_worker, 0) != pdPASS) {
     Serial.println("head worker creation failed");
     return;

@@ -66,7 +66,7 @@ def quantize_model(model, bits=4, group=64, quant_table=True, fp16_scales=False)
 
 
 def load(path, device):
-    ck = torch.load(path, map_location=device, weights_only=False)
+    ck = torch.load(path, map_location=device, weights_only=True)
     m = TinyLM(Config(**ck["cfg"])).to(device)
     m.load_state_dict(ck["state"])
     m.eval()
@@ -111,7 +111,7 @@ def main():
         path = os.path.join(RUNS, f"{arm}-{args.tag}-s{args.seed}.pt")
         if not os.path.exists(path):
             continue
-        cfg_vocab = torch.load(path, map_location="cpu", weights_only=False)["cfg"]["vocab_size"]
+        cfg_vocab = torch.load(path, map_location="cpu", weights_only=True)["cfg"]["vocab_size"]
 
         m = load(path, device)
         fp = val_loss(m, cfg_vocab, device)
