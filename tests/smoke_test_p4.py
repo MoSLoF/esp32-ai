@@ -149,10 +149,17 @@ def test_ino_conditional_includes():
     ino = read_file("esp32_p4.ino")
     assert ino is not None
     for flag, header in FEATURE_FLAGS.items():
-        pattern = rf'#if\s+{flag}\s*\n\s*#include\s+"{header}"'
-        assert re.search(pattern, ino), (
-            f'{header} not conditionally included under {flag}'
-        )
+        # FR-01: ota_espnow.h and ota_verify.h share one #if USE_OTA block.
+        if header == "ota_espnow.h":
+            pattern = rf'#if\s+{flag}\b.*?#include\s+"{header}"'
+            assert re.search(pattern, ino, re.DOTALL), (
+                f'{header} not conditionally included under {flag}'
+            )
+        else:
+            pattern = rf'#if\s+{flag}\s*\n\s*#include\s+"{header}"'
+            assert re.search(pattern, ino), (
+                f'{header} not conditionally included under {flag}'
+            )
 
 
 def test_guarded_symbols_in_ino():
@@ -663,8 +670,8 @@ def test_ea01_anti_rollback():
     ov = read_file("ota_verify.h")
     assert ov is not None
     assert "ota_verify_get_counter" in ov
-    assert "m.sec_counter < stored" in ov, (
-        "must reject manifest with sec_counter below stored"
+    assert "m.sec_counter <= stored" in ov, (
+        "must reject manifest with sec_counter at or below stored (FR-08)"
     )
 
 
@@ -684,8 +691,9 @@ def test_ea01_manifest_required_before_offer():
     assert "ota_verify_has_manifest" in ota, (
         "ota_espnow.h must check for verified manifest before accepting offer"
     )
-    assert "OTA_VERIFY_H" in ota, (
-        "ota_espnow.h must guard manifest logic on OTA_VERIFY_H"
+    # FR-01: manifest verification is now unconditional (no more OTA_VERIFY_H guards).
+    assert "ota_verify_manifest" in ota, (
+        "ota_espnow.h must call ota_verify_manifest directly"
     )
 
 
@@ -891,6 +899,269 @@ def test_sender_manifest_support():
     )
     assert "ESPNOW_MSG_OTA_MANIFEST" in ota_push, (
         "ota_push.h must define manifest frame type"
+    )
+
+
+# ---- FR (Fresh Reassessment) tests ----------------------------------------
+
+def test_fr01_ota_verify_unconditional():
+    """FR-01: OTA verify must be included unconditionally when USE_OTA is set."""
+    ino = (FIRMWARE_DIR / "esp32_p4.ino").read_text()
+    # Must not have USE_CRYPTO guard on ota_verify.h include.
+    assert 'USE_OTA && USE_CRYPTO' not in ino or '#error' in ino, (
+        "ota_verify.h include must not be guarded by USE_CRYPTO"
+    )
+    # Must have compile-time enforcement.
+    assert '#error' in ino, (
+        "must have #error for USE_OTA && !USE_CRYPTO"
+    )
+
+
+def test_fr01_no_placeholder_key():
+    """FR-01: ota_verify.h must not contain a placeholder public key."""
+    verify = read_file("ota_verify.h")
+    assert verify is not None
+    assert "AAAAAAAAAAAAA" not in verify, (
+        "ota_verify.h must not contain the placeholder all-zeros public key"
+    )
+    assert "#error" in verify, (
+        "ota_verify.h must require OTA_VERIFY_PUBKEY_PEM to be defined"
+    )
+
+
+def test_fr01_ota_espnow_no_ifdef_guard():
+    """FR-01: ota_espnow.h must not conditionally guard manifest logic."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    assert "#ifdef OTA_VERIFY_H" not in ota, (
+        "ota_espnow.h must not use #ifdef OTA_VERIFY_H guards"
+    )
+
+
+def test_fr02_mac_based_replay():
+    """FR-02: Replay tracking must use source MAC as primary key."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "mac[6]" in crypto, (
+        "replay table must store MAC address"
+    )
+    assert "src_mac" in crypto, (
+        "crypto_verify must accept src_mac parameter"
+    )
+    assert "memcmp" in crypto and "mac" in crypto, (
+        "replay lookup must compare MACs"
+    )
+
+
+def test_fr02_epoch_alternation_prevention():
+    """FR-02: Must prevent epoch alternation attacks."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "prev_epoch" in crypto, (
+        "replay table must track previous epoch"
+    )
+    assert "CRYPTO_EPOCH_SILENCE_US" in crypto, (
+        "must have silence period before accepting new epoch"
+    )
+
+
+def test_fr02_verify_fn_has_mac():
+    """FR-02: espnow_verify_fn_t must accept source MAC."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    m = re.search(r'typedef\s+int\s+\(\*espnow_verify_fn_t\)\((.*?)\)',
+                  en, re.DOTALL)
+    assert m is not None, "espnow_verify_fn_t must be defined"
+    params = m.group(1)
+    assert "src_mac" in params, (
+        "espnow_verify_fn_t must accept src_mac parameter"
+    )
+
+
+def test_fr02_sender_replay_table():
+    """FR-02: Sender must have replay protection on RX path."""
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    assert "_sender_replay" in sender, (
+        "sender must have replay table"
+    )
+    assert "SENDER_REPLAY_SLOTS" in sender, (
+        "sender must define replay slot count"
+    )
+
+
+def test_fr03_overflow_checked_mul():
+    """FR-03: llm.h bind_q/bind_f must use overflow-checked multiplication."""
+    llm = (COMMON_DIR / "llm.h").read_text()
+    assert "_llm_mul_overflow" in llm, (
+        "llm.h must define overflow-checked multiplication helper"
+    )
+    # Must use the helper in bind_q and bind_f.
+    bind_q_start = llm.index("bind_q")
+    bind_f_start = llm.index("bind_f")
+    bind_q_section = llm[bind_q_start:bind_f_start]
+    assert "_llm_mul_overflow" in bind_q_section, (
+        "bind_q must use overflow-checked multiplication"
+    )
+    bind_f_section = llm[bind_f_start:bind_f_start + 500]
+    assert "_llm_mul_overflow" in bind_f_section, (
+        "bind_f must use overflow-checked multiplication"
+    )
+
+
+def test_fr03_safe_pointer_comparison():
+    """FR-03: Must not use p + sz > end pattern (pointer overflow UB)."""
+    llm = (COMMON_DIR / "llm.h").read_text()
+    # The safe pattern is sz > (size_t)(end - p), not p + sz > end.
+    assert "end - p" in llm, (
+        "must use end - p pattern for safe bounds checking"
+    )
+
+
+def test_fr04_keygen_tool():
+    """FR-04: tools/ota_keygen.py must exist."""
+    keygen = Path(__file__).parent.parent / "tools" / "ota_keygen.py"
+    assert keygen.exists(), "tools/ota_keygen.py must exist"
+    content = keygen.read_text()
+    assert "prime256v1" in content or "P-256" in content, (
+        "keygen must generate P-256 keys"
+    )
+
+
+def test_fr04_sign_manifest_tool():
+    """FR-04: tools/ota_sign_manifest.py must exist."""
+    sign_tool = Path(__file__).parent.parent / "tools" / "ota_sign_manifest.py"
+    assert sign_tool.exists(), "tools/ota_sign_manifest.py must exist"
+    content = sign_tool.read_text()
+    assert "OTA_MANIFEST_MAGIC" in content, (
+        "sign tool must use OTA manifest magic"
+    )
+
+
+def test_fr04_ota_push_requires_manifest():
+    """FR-04: ota_push.py must require --manifest for push."""
+    push_py = Path(__file__).parent.parent / "tools" / "ota_push.py"
+    content = push_py.read_text()
+    assert "--manifest" in content, (
+        "ota_push.py must accept --manifest argument"
+    )
+
+
+def test_fr04_nvs_init_standalone():
+    """FR-04: NVS must be initialized even when peer_protocol is disabled."""
+    ino = (FIRMWARE_DIR / "esp32_p4.ino").read_text()
+    assert "nvs_flash_init" in ino, (
+        "must have standalone NVS init for OTA without peer_protocol"
+    )
+
+
+def test_fr05_ota_data_sender_binding():
+    """FR-05: OTA data callback must check sender MAC."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    # Find the OTA_DATA case and check for MAC binding.
+    data_case = ota[ota.index("ESPNOW_MSG_OTA_DATA"):]
+    data_section = data_case[:data_case.index("break;")]
+    assert "sender_mac" in data_section, (
+        "OTA data handler must verify sender MAC matches accepted sender"
+    )
+
+
+def test_fr06_two_tier_rate_limiting():
+    """FR-06: Must have separate pre-auth and post-auth rate budgets."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "ESPNOW_RX_AUTHED_RESERVE" in en, (
+        "must define reserved authenticated budget"
+    )
+    assert "_espnow_rx_authed_count" in en or "_espnow_authed_budget" in en, (
+        "must have authenticated budget tracking"
+    )
+
+
+def test_fr06_diagnostic_counters():
+    """FR-06: Must have diagnostic counters for rate limiting."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "_espnow_diag_preauth_drop" in en, (
+        "must track pre-auth drops"
+    )
+    assert "_espnow_diag_authed_pass" in en, (
+        "must track authenticated passes via reserved budget"
+    )
+
+
+def test_fr07_sender_spsc_rings():
+    """FR-07: Sender ota_push.h must use SPSC ring buffers, not volatile."""
+    push = (SENDER_DIR / "ota_push.h").read_text()
+    # Strip comments before checking for volatile declarations.
+    code_lines = [l for l in push.split('\n') if not l.strip().startswith('//')]
+    code = '\n'.join(code_lines)
+    assert "volatile" not in code, (
+        "ota_push.h must not use volatile .pending pattern"
+    )
+    assert "OTAP_RING" in push, (
+        "must define SPSC ring buffer size"
+    )
+    assert "__atomic_load_n" in push, (
+        "must use atomic operations for ring buffer indices"
+    )
+    assert "__atomic_store_n" in push, (
+        "must use atomic stores for ring buffer indices"
+    )
+
+
+def test_fr08_negative_validate_clears():
+    """FR-08: Negative VALIDATE must clear inbound_responded."""
+    peer = read_file("peer_protocol.h")
+    assert peer is not None
+    # Find the else branch after VALIDATE handling.
+    else_idx = peer.index("rejected our response")
+    else_section = peer[else_idx - 200:else_idx]
+    assert "inbound_responded" in else_section, (
+        "negative VALIDATE must clear inbound_responded"
+    )
+
+
+def test_fr08_strict_counter_increase():
+    """FR-08: Anti-rollback must use strict increase (<=), not just (<)."""
+    verify = read_file("ota_verify.h")
+    assert verify is not None
+    assert "sec_counter <= stored" in verify or "m.sec_counter <= stored" in verify, (
+        "anti-rollback must reject equal counter values"
+    )
+
+
+def test_fr08_deferred_counter_commit():
+    """FR-08: Security counter must be committed after all checks pass."""
+    verify = read_file("ota_verify.h")
+    assert verify is not None
+    assert "ota_verify_commit_counter" in verify, (
+        "must have separate counter commit function"
+    )
+    # sha_finish must NOT call nvs_set_u32 directly.
+    sha_fn_start = verify.index("ota_verify_sha_finish")
+    commit_fn_start = verify.index("ota_verify_commit_counter")
+    sha_fn = verify[sha_fn_start:commit_fn_start]
+    assert "nvs_set_u32" not in sha_fn, (
+        "sha_finish must not commit counter directly"
+    )
+
+    # The commit must happen in ota_espnow.h after finalization.
+    ota = read_file("ota_espnow.h")
+    assert "ota_verify_commit_counter" in ota, (
+        "ota_espnow.h must call commit_counter after finalization"
+    )
+
+
+def test_fr08_boot_partition_checked():
+    """FR-08: esp_ota_set_boot_partition return must be checked."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    # Find set_boot_partition and ensure its return is used.
+    boot_idx = ota.index("esp_ota_set_boot_partition")
+    boot_section = ota[boot_idx - 30:boot_idx + 100]
+    assert "esp_err_t" in boot_section or "eb" in boot_section, (
+        "esp_ota_set_boot_partition return value must be checked"
     )
 
 

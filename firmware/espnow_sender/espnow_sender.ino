@@ -58,6 +58,15 @@ static const PromptEntry PROMPTS[] = {
 };
 static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 
+// FR-02: sender-side replay table (4 slots, keyed by source MAC).
+#define SENDER_REPLAY_SLOTS 4
+static struct {
+  uint8_t mac[6];
+  uint32_t epoch;
+  uint32_t last_seq;
+  bool active;
+} _sender_replay[SENDER_REPLAY_SLOTS];
+
 // Peer protocol frame type for passive scanning.
 #define ESPNOW_MSG_IDENTITY 0x04
 
@@ -78,12 +87,37 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   if (len < 1) return;
 
   // EA-04: verify incoming frames when crypto is enabled.
+  // FR-02: sender-side replay protection.
   int verified_len = len;
 #if USE_CRYPTO
   {
     uint32_t ep, sq;
     verified_len = crypto_env_verify(_sender_psk, data, len, &ep, &sq);
     if (verified_len <= 0) return;
+
+    // Replay check keyed by source MAC.
+    int slot = -1, evict = 0;
+    for (int i = 0; i < SENDER_REPLAY_SLOTS; i++) {
+      if (_sender_replay[i].active &&
+          memcmp(_sender_replay[i].mac, info->src_addr, 6) == 0) {
+        slot = i; break;
+      }
+      if (!_sender_replay[i].active) evict = i;
+    }
+    if (slot >= 0) {
+      if (ep == _sender_replay[slot].epoch) {
+        if (sq <= _sender_replay[slot].last_seq) return;
+        _sender_replay[slot].last_seq = sq;
+      } else {
+        _sender_replay[slot].epoch = ep;
+        _sender_replay[slot].last_seq = sq;
+      }
+    } else {
+      memcpy(_sender_replay[evict].mac, info->src_addr, 6);
+      _sender_replay[evict].epoch = ep;
+      _sender_replay[evict].last_seq = sq;
+      _sender_replay[evict].active = true;
+    }
   }
 #endif
 
@@ -146,6 +180,7 @@ void setup() {
   esp_now_add_peer(&peer);
 
   ota_push_init();
+  memset(_sender_replay, 0, sizeof(_sender_replay));
 
 #if USE_CRYPTO
   _sender_epoch = esp_random();

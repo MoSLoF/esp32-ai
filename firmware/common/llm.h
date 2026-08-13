@@ -30,6 +30,13 @@ typedef struct {
   int rows, cols, group, n_groups, row_bytes;
 } QT;
 
+// Checked multiplication for 32-bit safety (FR-03).
+static inline bool _llm_mul_overflow(size_t a, size_t b, size_t *out) {
+  if (a != 0 && b > (size_t)-1 / a) return true;
+  *out = a * b;
+  return false;
+}
+
 // IEEE half -> float.
 static inline float half2float(uint16_t h) {
   uint32_t sign = (uint32_t)(h & 0x8000) << 16;
@@ -78,20 +85,25 @@ static const uint8_t *bind_q(const uint8_t *p, const uint8_t *end,
   t->rows = rows; t->cols = cols; t->group = group;
   t->n_groups = (cols + group - 1) / group;
   t->row_bytes = (cols + 1) / 2;
-  size_t codes_sz = (size_t)rows * t->row_bytes;
-  if (p + codes_sz > end) return NULL;
+  size_t codes_sz;
+  if (_llm_mul_overflow((size_t)rows, (size_t)t->row_bytes, &codes_sz)) return NULL;
+  if (codes_sz > (size_t)(end - p)) return NULL;
   t->codes = p;  p += codes_sz;
-  if ((uintptr_t)p & 1) p++;
-  size_t scales_sz = (size_t)rows * t->n_groups * 2;
-  if (p + scales_sz > end) return NULL;
+  if ((uintptr_t)p & 1) { if (p >= end) return NULL; p++; }
+  size_t rng;
+  if (_llm_mul_overflow((size_t)rows, (size_t)t->n_groups, &rng)) return NULL;
+  size_t scales_sz;
+  if (_llm_mul_overflow(rng, 2, &scales_sz)) return NULL;
+  if (scales_sz > (size_t)(end - p)) return NULL;
   t->scales = (const uint16_t *)p;  p += scales_sz;
   return p;
 }
 static const uint8_t *bind_f(const uint8_t *p, const uint8_t *end,
                               const float **t, int n) {
   if (!p) return NULL;
-  size_t sz = (size_t)n * sizeof(float);
-  if (p + sz > end) return NULL;
+  size_t sz;
+  if (_llm_mul_overflow((size_t)n, sizeof(float), &sz)) return NULL;
+  if (sz > (size_t)(end - p)) return NULL;
   *t = (const float *)p;  return p + sz;
 }
 

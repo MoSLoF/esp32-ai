@@ -58,12 +58,11 @@ typedef struct __attribute__((packed)) {
 
 // Built-in ECDSA P-256 public key (PEM).
 // Override at compile time for your release signing key.
+// FR-01/FR-04: real ECDSA P-256 public key for OTA manifest verification.
+// Override with -DOTA_VERIFY_PUBKEY_PEM="..." for your release signing key.
+// Generate a key pair with: tools/ota_keygen.py
 #ifndef OTA_VERIFY_PUBKEY_PEM
-#define OTA_VERIFY_PUBKEY_PEM \
-  "-----BEGIN PUBLIC KEY-----\n" \
-  "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAA\n" \
-  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n" \
-  "-----END PUBLIC KEY-----\n"
+#error "OTA_VERIFY_PUBKEY_PEM must be defined — run tools/ota_keygen.py to generate a signing key pair"
 #endif
 
 #ifndef OTA_PRODUCT_ID
@@ -127,9 +126,10 @@ static bool ota_verify_manifest(const uint8_t *data, int len) {
     return false;
   }
 
+  // FR-08: strict increase — equal counter is also rejected.
   uint32_t stored = ota_verify_get_counter();
-  if (m.sec_counter < stored) {
-    Serial.printf("[ota-verify] anti-rollback: manifest %u < stored %u\n",
+  if (m.sec_counter <= stored) {
+    Serial.printf("[ota-verify] anti-rollback: manifest %u <= stored %u\n",
                   m.sec_counter, stored);
     return false;
   }
@@ -183,6 +183,8 @@ static void ota_verify_sha_update(const uint8_t *data, int len) {
     mbedtls_sha256_update(&_otav_sha_ctx, data, len);
 }
 
+// FR-08: SHA-256 check only — does NOT commit the security counter.
+// Call ota_verify_commit_counter() after CRC check and OTA finalization.
 static bool ota_verify_sha_finish() {
   if (!_otav_sha_active || !_otav_manifest.valid) return false;
   uint8_t computed[OTA_SHA256_LEN];
@@ -199,9 +201,20 @@ static bool ota_verify_sha_finish() {
     return false;
   }
 
-  nvs_set_u32(_otav_nvs, "sec_ctr", _otav_manifest.sec_counter);
-  nvs_commit(_otav_nvs);
-  Serial.println("[ota-verify] SHA-256 verified, counter updated");
+  Serial.println("[ota-verify] SHA-256 verified");
+  return true;
+}
+
+// FR-08: commit security counter AFTER all checks pass (CRC + SHA + OTA end).
+static bool ota_verify_commit_counter() {
+  if (!_otav_manifest.valid) return false;
+  esp_err_t e1 = nvs_set_u32(_otav_nvs, "sec_ctr", _otav_manifest.sec_counter);
+  esp_err_t e2 = nvs_commit(_otav_nvs);
+  if (e1 != ESP_OK || e2 != ESP_OK) {
+    Serial.printf("[ota-verify] NVS commit failed: set=%d commit=%d\n", e1, e2);
+    return false;
+  }
+  Serial.printf("[ota-verify] counter updated to %u\n", _otav_manifest.sec_counter);
   return true;
 }
 

@@ -30,6 +30,11 @@
 #define USE_CRYPTO        0   // HMAC frame signing (crypto_peer.h)
 #define USE_COMPANION     0   // UART JSON companion app (companion_uart.h)
 
+// FR-01: OTA requires crypto — fail at compile time if misconfigured.
+#if USE_OTA && !USE_CRYPTO
+#error "USE_OTA requires USE_CRYPTO — firmware signing is mandatory"
+#endif
+
 // Auto-enable ESP-NOW when features that need it are on.
 #if (USE_PEER_PROTOCOL || USE_OTA || USE_MESH) && !USE_ESPNOW
 #undef USE_ESPNOW
@@ -46,10 +51,9 @@
 #if USE_PEER_PROTOCOL
 #include "peer_protocol.h"
 #endif
-#if USE_OTA && USE_CRYPTO
-#include "ota_verify.h"
-#endif
+// FR-01: ota_verify.h always included with OTA (crypto is mandatory).
 #if USE_OTA
+#include "ota_verify.h"
 #include "ota_espnow.h"
 #endif
 #if USE_SD
@@ -389,10 +393,21 @@ void setup() {
     sd_setup(_did, "p4-device", 0);
   }
 #endif
-#if USE_OTA && USE_CRYPTO
-  ota_verify_init();
+// FR-04: ensure NVS is initialized even when peer_protocol is disabled.
+#if USE_OTA && !USE_PEER_PROTOCOL
+  {
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      nvs_flash_erase();
+      nvs_err = nvs_flash_init();
+    }
+    if (nvs_err != ESP_OK)
+      Serial.printf("[nvs] init failed: %d\n", nvs_err);
+  }
 #endif
 #if USE_OTA
+  ota_verify_init();
   ota_init();
 #endif
 #if USE_DISPLAY && USE_PEER_PROTOCOL

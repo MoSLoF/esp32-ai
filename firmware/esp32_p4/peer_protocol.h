@@ -578,6 +578,8 @@ static void peer_tick() {
 #endif
       }
     } else if (p) {
+      // FR-08: consume the validation regardless of pass/fail.
+      if (p->inbound_responded) p->inbound_responded = false;
       Serial.printf("  %s  %s\n", persona()->face_rejected,
                     persona()->quip_failed);
       Serial.printf("[x] %s rejected our response\n", p->name);
