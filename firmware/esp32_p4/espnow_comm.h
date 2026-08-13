@@ -39,10 +39,13 @@
 // Broadcast address (all peers).
 static const uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// Per-MAC rate limiting (EA-07): separate pre-auth and post-auth buckets.
-#define ESPNOW_RX_LIMIT       100
-#define ESPNOW_RX_MAC_SLOTS   8
-#define ESPNOW_RX_GLOBAL_CEIL 500
+// Per-MAC rate limiting (EA-07): separate pre-auth and post-auth budgets.
+// FR-06: reserved authenticated budget prevents unauthenticated traffic
+// from starving verified peers.
+#define ESPNOW_RX_LIMIT           100
+#define ESPNOW_RX_MAC_SLOTS       8
+#define ESPNOW_RX_GLOBAL_CEIL     500
+#define ESPNOW_RX_AUTHED_RESERVE  100
 
 static struct {
   uint8_t mac[6];
@@ -52,6 +55,12 @@ static struct {
 } _espnow_rx_mac[ESPNOW_RX_MAC_SLOTS];
 static uint32_t _espnow_rx_global = 0;
 static int64_t _espnow_rx_global_window = 0;
+static uint32_t _espnow_rx_authed_count = 0;
+static int64_t _espnow_rx_authed_window = 0;
+
+// FR-06: diagnostic counters.
+static uint32_t _espnow_diag_preauth_drop = 0;
+static uint32_t _espnow_diag_authed_pass = 0;
 
 // Prompt buffer spinlock for cross-core safety (V-09, V-15).
 static portMUX_TYPE _espnow_prompt_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -75,8 +84,10 @@ static void espnow_register_peer_handler(espnow_peer_handler_t handler) {
 }
 
 // Crypto hooks — set via espnow_set_crypto() when USE_CRYPTO is enabled.
+// FR-02: verify callback receives source MAC for replay keying.
 typedef int (*espnow_sign_fn_t)(uint8_t *frame, int len);
-typedef int (*espnow_verify_fn_t)(const uint8_t *frame, int len);
+typedef int (*espnow_verify_fn_t)(const uint8_t *src_mac,
+                                   const uint8_t *frame, int len);
 
 static espnow_sign_fn_t _espnow_sign_fn = NULL;
 static espnow_verify_fn_t _espnow_verify_fn = NULL;
@@ -149,19 +160,44 @@ static bool _espnow_mac_ratelimit(const uint8_t *mac, int64_t now_us) {
   return true;
 }
 
+// FR-06: check if authenticated traffic has reserved budget remaining.
+static bool _espnow_authed_budget(int64_t now_us) {
+  if (now_us - _espnow_rx_authed_window > 1000000) {
+    _espnow_rx_authed_count = 0;
+    _espnow_rx_authed_window = now_us;
+  }
+  return (++_espnow_rx_authed_count <= ESPNOW_RX_AUTHED_RESERVE);
+}
+
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
 
-  // EA-07: per-source-MAC rate limiting.
+  // FR-06 two-tier rate limiting:
+  // 1. Pre-auth global ceiling applies to ALL traffic.
+  // 2. If pre-auth budget is exhausted, authenticated frames still pass
+  //    via the reserved authenticated budget.
   int64_t now_us = esp_timer_get_time();
-  if (!_espnow_mac_ratelimit(info->src_addr, now_us)) return;
+  bool preauth_ok = _espnow_mac_ratelimit(info->src_addr, now_us);
 
   // EA-08: when crypto is enabled, verify ALL frame types.
   int verified_len = len;
   if (_espnow_verify_fn) {
-    verified_len = _espnow_verify_fn(data, len);
+    verified_len = _espnow_verify_fn(info->src_addr, data, len);
     if (verified_len <= 0) return;
+    // Authenticated frame — if pre-auth budget was exhausted, use reserved.
+    if (!preauth_ok) {
+      if (_espnow_authed_budget(now_us)) {
+        _espnow_diag_authed_pass++;
+      } else {
+        return;
+      }
+    }
+  } else {
+    if (!preauth_ok) {
+      _espnow_diag_preauth_drop++;
+      return;
+    }
   }
 
   uint8_t type = data[0];

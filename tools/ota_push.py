@@ -29,6 +29,7 @@ def main():
     ap.add_argument("port", help="serial port (e.g. /dev/ttyUSB0, COM3)")
     ap.add_argument("firmware", help="firmware .bin file to push")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--manifest", help="signed manifest file (required for push)")
     ap.add_argument("--no-push", action="store_true",
                     help="upload only, don't auto-start the ESP-NOW push")
     args = ap.parse_args()
@@ -97,10 +98,46 @@ def main():
         ser.close()
         return 1
 
+    # FR-04: upload manifest if provided.
+    if args.manifest:
+        if not os.path.isfile(args.manifest):
+            print(f"manifest not found: {args.manifest}", file=sys.stderr)
+            ser.close()
+            return 1
+        manifest = open(args.manifest, "rb").read()
+        print(f"uploading manifest: {len(manifest)} bytes")
+        ser.write(f"manifest {len(manifest)}\n".encode())
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            line = ser.readline().decode(errors="replace").strip()
+            if line:
+                print(f"  < {line}")
+            if line == "READY":
+                break
+        else:
+            print("timeout waiting for manifest READY", file=sys.stderr)
+            ser.close()
+            return 1
+        ser.write(manifest)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            line = ser.readline().decode(errors="replace").strip()
+            if line:
+                print(f"  < {line}")
+            if "manifest loaded" in line.lower():
+                break
+
     if args.no_push:
         print("upload complete (--no-push: not starting ESP-NOW transfer)")
         ser.close()
         return 0
+
+    # FR-04: require manifest for push.
+    if not args.manifest:
+        print("error: --manifest is required for OTA push (firmware signing is mandatory)",
+              file=sys.stderr)
+        ser.close()
+        return 1
 
     # Start ESP-NOW push.
     print("starting ESP-NOW OTA push...")

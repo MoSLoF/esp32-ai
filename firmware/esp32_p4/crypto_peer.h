@@ -50,11 +50,13 @@ static uint32_t _crypto_epoch = 0;
 // Monotonic TX sequence counter.
 static uint32_t _crypto_tx_seq = 0;
 
-// Per-sender replay tracking with epoch (EA-06).
+// FR-02: MAC-based replay tracking with epoch alternation prevention.
 #define CRYPTO_REPLAY_SLOTS 16
+#define CRYPTO_EPOCH_SILENCE_US 5000000  // 5s silence before accepting new epoch
 static struct {
-  uint32_t sender_id;
+  uint8_t mac[6];
   uint32_t epoch;
+  uint32_t prev_epoch;
   uint32_t last_seq;
   int64_t last_seen_us;
   bool active;
@@ -77,55 +79,60 @@ static int crypto_sign(uint8_t *frame, int len) {
   return crypto_env_sign(_crypto_psk, frame, len, _crypto_epoch, seq);
 }
 
-// Verify and strip the crypto envelope. Returns the inner payload length
-// (>0) on success, 0 on failure (bad tag or replay).
-static int crypto_verify(const uint8_t *frame, int len) {
+// FR-02: verify and strip the crypto envelope. Uses source MAC as primary
+// replay key so ALL frame sizes (including 3-byte tokens) get replay
+// protection. Prevents epoch alternation attacks by requiring a silence
+// period before accepting a new epoch and rejecting the previous epoch.
+static int crypto_verify(const uint8_t *src_mac,
+                          const uint8_t *frame, int len) {
   if (!_crypto_ready) return len;
 
   uint32_t epoch, seq;
   int payload_len = crypto_env_verify(_crypto_psk, frame, len, &epoch, &seq);
   if (payload_len <= 0) return 0;
 
-  // Per-sender replay check: extract sender_id from the payload
-  // (extension frames carry device_id at bytes 1-4; prompt/token frames
-  // don't, but still benefit from epoch+seq monotonicity).
-  if (payload_len >= 5) {
-    uint32_t sender_id;
-    memcpy(&sender_id, frame + 1, 4);
-
-    int slot = -1, evict = 0;
-    int64_t oldest_us = INT64_MAX;
-    for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
-      if (_crypto_replay[i].active && _crypto_replay[i].sender_id == sender_id) {
-        slot = i; break;
-      }
-      if (!_crypto_replay[i].active) { evict = i; oldest_us = 0; }
-      else if (_crypto_replay[i].last_seen_us < oldest_us) {
-        oldest_us = _crypto_replay[i].last_seen_us; evict = i;
-      }
+  // FR-02: MAC-based replay tracking for all frame sizes.
+  int slot = -1, evict = 0;
+  int64_t oldest_us = INT64_MAX;
+  for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
+    if (_crypto_replay[i].active &&
+        memcmp(_crypto_replay[i].mac, src_mac, 6) == 0) {
+      slot = i; break;
     }
+    if (!_crypto_replay[i].active) { evict = i; oldest_us = 0; }
+    else if (_crypto_replay[i].last_seen_us < oldest_us) {
+      oldest_us = _crypto_replay[i].last_seen_us; evict = i;
+    }
+  }
 
-    int64_t now_us = esp_timer_get_time();
+  int64_t now_us = esp_timer_get_time();
 
-    if (slot >= 0) {
-      // EA-06: epoch-based session tracking replaces time-based reset.
-      if (epoch != _crypto_replay[slot].epoch) {
-        // New epoch = sender rebooted. Accept as new session.
-        _crypto_replay[slot].epoch = epoch;
-        _crypto_replay[slot].last_seq = seq;
-      } else if (seq <= _crypto_replay[slot].last_seq) {
+  if (slot >= 0) {
+    if (epoch == _crypto_replay[slot].epoch) {
+      if (seq <= _crypto_replay[slot].last_seq)
         return 0;
-      } else {
-        _crypto_replay[slot].last_seq = seq;
-      }
-      _crypto_replay[slot].last_seen_us = now_us;
+      _crypto_replay[slot].last_seq = seq;
+    } else if (epoch == _crypto_replay[slot].prev_epoch) {
+      // FR-02: reject previous epoch to prevent alternation attack.
+      return 0;
     } else {
-      _crypto_replay[evict].sender_id = sender_id;
-      _crypto_replay[evict].epoch = epoch;
-      _crypto_replay[evict].last_seq = seq;
-      _crypto_replay[evict].last_seen_us = now_us;
-      _crypto_replay[evict].active = true;
+      // New epoch — require silence period before accepting.
+      int64_t silence = now_us - _crypto_replay[slot].last_seen_us;
+      if (silence < CRYPTO_EPOCH_SILENCE_US)
+        return 0;
+      _crypto_replay[slot].prev_epoch = _crypto_replay[slot].epoch;
+      _crypto_replay[slot].epoch = epoch;
+      _crypto_replay[slot].last_seq = seq;
     }
+    _crypto_replay[slot].last_seen_us = now_us;
+  } else {
+    // New MAC — evicted senders start fresh (no baseline advantage).
+    memcpy(_crypto_replay[evict].mac, src_mac, 6);
+    _crypto_replay[evict].epoch = epoch;
+    _crypto_replay[evict].prev_epoch = 0;
+    _crypto_replay[evict].last_seq = seq;
+    _crypto_replay[evict].last_seen_us = now_us;
+    _crypto_replay[evict].active = true;
   }
 
   return payload_len;

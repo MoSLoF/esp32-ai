@@ -75,13 +75,13 @@ static struct {
 } _ota_data_ring[OTA_RX_RING];
 static int _ota_data_wr = 0, _ota_data_rd = 0;
 
-#ifdef OTA_VERIFY_H
+// FR-01: manifest ring is always present (ota_verify.h always included with OTA).
 static struct {
   uint8_t payload[sizeof(OtaManifest) + 1];
   int len;
+  uint8_t mac[6];
 } _ota_manifest_ring[OTA_RX_RING];
 static int _ota_manifest_wr = 0, _ota_manifest_rd = 0;
-#endif
 
 // ---- CRC32 -----------------------------------------------------------------
 static uint32_t _ota_crc32(uint32_t prev, const uint8_t *d, int n) {
@@ -141,7 +141,9 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
     break;
 
   case ESPNOW_MSG_OTA_DATA:
-    if (len >= 8 && _ota.state == OTA_ACTIVE) {
+    // FR-05: bind data to the accepted sender's MAC.
+    if (len >= 8 && _ota.state == OTA_ACTIVE
+        && memcmp(mac, _ota.sender_mac, 6) == 0) {
       uint16_t seq; memcpy(&seq, d + 5, 2);
       uint8_t dlen = d[7];
       if (dlen > OTA_CHUNK_SIZE) dlen = OTA_CHUNK_SIZE;
@@ -157,8 +159,8 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
     }
     break;
 
-#ifdef OTA_VERIFY_H
   case ESPNOW_MSG_OTA_MANIFEST:
+    // FR-05: record sender MAC for binding check.
     if (len >= 2 && _ota.state == OTA_IDLE) {
       int payload_len = len - 1;
       if (payload_len > (int)sizeof(OtaManifest)) payload_len = sizeof(OtaManifest);
@@ -167,11 +169,11 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
       if (next != __atomic_load_n(&_ota_manifest_rd, __ATOMIC_ACQUIRE)) {
         memcpy(_ota_manifest_ring[wr].payload, d + 1, payload_len);
         _ota_manifest_ring[wr].len = payload_len;
+        memcpy(_ota_manifest_ring[wr].mac, mac, 6);
         __atomic_store_n(&_ota_manifest_wr, next, __ATOMIC_RELEASE);
       }
     }
     break;
-#endif
   }
 }
 
@@ -181,9 +183,7 @@ static void ota_init() {
   memset(&_ota, 0, sizeof(_ota));
   _ota_offer_wr = _ota_offer_rd = 0;
   _ota_data_wr = _ota_data_rd = 0;
-#ifdef OTA_VERIFY_H
   _ota_manifest_wr = _ota_manifest_rd = 0;
-#endif
   espnow_register_peer_handler(_ota_rx);
   _ota.ready = true;
   Serial.println("OTA receiver ready");
@@ -193,17 +193,18 @@ static void ota_tick() {
   if (!_ota.ready) return;
   int64_t now = _ota_ms();
 
-#ifdef OTA_VERIFY_H
-  // Process manifest frames.
+  // FR-01: manifest verification is unconditional (ota_verify.h always included).
   for (;;) {
     int rd = __atomic_load_n(&_ota_manifest_rd, __ATOMIC_RELAXED);
     if (rd == __atomic_load_n(&_ota_manifest_wr, __ATOMIC_ACQUIRE)) break;
-    ota_verify_manifest(_ota_manifest_ring[rd].payload,
-                        _ota_manifest_ring[rd].len);
+    if (ota_verify_manifest(_ota_manifest_ring[rd].payload,
+                            _ota_manifest_ring[rd].len)) {
+      // FR-05: record the manifest sender's MAC for offer binding.
+      memcpy(_ota.sender_mac, _ota_manifest_ring[rd].mac, 6);
+    }
     __atomic_store_n(&_ota_manifest_rd, (rd + 1) % OTA_RX_RING,
                      __ATOMIC_RELEASE);
   }
-#endif
 
   // Process OTA offer (with cooldown to prevent DoS via repeated offers).
   {
@@ -218,15 +219,13 @@ static void ota_tick() {
 
       uint32_t offer_fw_size = _ota_offer_ring[rd].fw_size;
 
-#ifdef OTA_VERIFY_H
-      // EA-01: require verified manifest before accepting OTA offer.
+      // FR-01: always require verified manifest before accepting OTA offer.
       if (!ota_verify_has_manifest(offer_fw_size)) {
         Serial.println("[ota] offer rejected: no verified manifest");
         __atomic_store_n(&_ota_offer_rd, (rd + 1) % OTA_RX_RING,
                          __ATOMIC_RELEASE);
         return;
       }
-#endif
 
       _ota.last_offer_time = now;
       _ota.sender_id = _ota_offer_ring[rd].id;
@@ -264,9 +263,7 @@ static void ota_tick() {
       _ota.crc = 0;
       _ota.retries = 0;
 
-#ifdef OTA_VERIFY_H
       ota_verify_sha_begin();
-#endif
 
       Serial.printf("[ota] accepted: %u bytes, %d chunks from 0x%08X\n",
                     _ota.fw_size, _ota.n_chunks, _ota.sender_id);
@@ -303,17 +300,13 @@ static void ota_tick() {
           _ota_tx_status(OTA_STATUS_ERROR);
           esp_ota_abort(_ota.handle);
           _ota.state = OTA_IDLE;
-#ifdef OTA_VERIFY_H
           ota_verify_reset();
-#endif
           __atomic_store_n(&_ota_data_rd, (rd + 1) % OTA_RX_RING,
                            __ATOMIC_RELEASE);
           return;
         }
         _ota.crc = _ota_crc32(_ota.crc, _ota_data_ring[rd].data, dlen);
-#ifdef OTA_VERIFY_H
         ota_verify_sha_update(_ota_data_ring[rd].data, dlen);
-#endif
         _ota.written += dlen;
         _ota.next_seq++;
         _ota.retries = 0;
@@ -326,11 +319,7 @@ static void ota_tick() {
         if (_ota.next_seq >= _ota.n_chunks) {
           // All chunks received — verify and finalize.
           bool crc_ok = (_ota.crc == _ota.expected_crc);
-#ifdef OTA_VERIFY_H
           bool sha_ok = ota_verify_sha_finish();
-#else
-          bool sha_ok = true;
-#endif
           if (!crc_ok) {
             Serial.printf("[ota] CRC mismatch: got 0x%08X, expected 0x%08X\n",
                           _ota.crc, _ota.expected_crc);
@@ -349,12 +338,21 @@ static void ota_tick() {
               _ota_tx_status(OTA_STATUS_ERROR);
               _ota.state = OTA_IDLE;
             } else {
-              esp_ota_set_boot_partition(_ota.part);
-              _ota_tx_status(OTA_STATUS_COMPLETE);
-              Serial.println("[ota] update complete, rebooting in 2s...");
-              _ota.state = OTA_DONE;
-              delay(2000);
-              esp_restart();
+              // FR-08: check set_boot_partition return value.
+              esp_err_t eb = esp_ota_set_boot_partition(_ota.part);
+              if (eb != ESP_OK) {
+                Serial.printf("[ota] set_boot_partition failed: %d\n", eb);
+                _ota_tx_status(OTA_STATUS_ERROR);
+                _ota.state = OTA_IDLE;
+              } else {
+                // FR-08: commit counter AFTER all finalization succeeds.
+                ota_verify_commit_counter();
+                _ota_tx_status(OTA_STATUS_COMPLETE);
+                Serial.println("[ota] update complete, rebooting in 2s...");
+                _ota.state = OTA_DONE;
+                delay(2000);
+                esp_restart();
+              }
             }
           }
         } else {
@@ -376,9 +374,7 @@ static void ota_tick() {
       _ota_tx_status(OTA_STATUS_ABORT);
       esp_ota_abort(_ota.handle);
       _ota.state = OTA_IDLE;
-#ifdef OTA_VERIFY_H
       ota_verify_reset();
-#endif
     } else {
       _ota_tx_request(_ota.next_seq);
       _ota.last_req = now;

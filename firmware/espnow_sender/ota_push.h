@@ -66,14 +66,18 @@ static uint32_t _otap_crc32(const uint8_t *d, uint32_t n) {
   return ~c;
 }
 
-// ---- incoming request buffer -----------------------------------------------
-static volatile struct {
-  bool pending; uint16_t seq; uint8_t mac[6];
-} _otap_req;
+// FR-07: SPSC ring buffers replace volatile compound state.
+#define OTAP_RING 4
 
-static volatile struct {
-  bool pending; uint8_t status; uint8_t mac[6];
-} _otap_status;
+static struct {
+  uint16_t seq; uint8_t mac[6];
+} _otap_req_ring[OTAP_RING];
+static int _otap_req_wr = 0, _otap_req_rd = 0;
+
+static struct {
+  uint8_t status; uint8_t mac[6];
+} _otap_status_ring[OTAP_RING];
+static int _otap_status_wr = 0, _otap_status_rd = 0;
 
 // EA-04: sign and send a frame.
 static void _otap_send_signed(const uint8_t *dest, uint8_t *frame,
@@ -85,12 +89,11 @@ static void _otap_send_signed(const uint8_t *dest, uint8_t *frame,
   esp_now_send(dest, frame, len);
 }
 
-// ---- RX handler ------------------------------------------------------------
+// FR-07: RX handler uses SPSC ring buffers with acquire/release atomics.
 static void _otap_rx(const esp_now_recv_info_t *info,
                       const uint8_t *d, int len) {
   if (len < 1) return;
 
-  // EA-04: verify incoming frames when crypto is enabled.
   int verified_len = len;
   if (_otap_crypto_enabled) {
     uint32_t ep, sq;
@@ -99,16 +102,23 @@ static void _otap_rx(const esp_now_recv_info_t *info,
   }
 
   if (d[0] == ESPNOW_MSG_OTA_REQUEST && verified_len >= 7) {
-    uint16_t seq; memcpy(&seq, d + 5, 2);
-    _otap_req.seq = seq;
-    memcpy((void *)_otap_req.mac, info->src_addr, 6);
-    _otap_req.pending = true;
+    int wr = __atomic_load_n(&_otap_req_wr, __ATOMIC_RELAXED);
+    int next = (wr + 1) % OTAP_RING;
+    if (next != __atomic_load_n(&_otap_req_rd, __ATOMIC_ACQUIRE)) {
+      memcpy(&_otap_req_ring[wr].seq, d + 5, 2);
+      memcpy(_otap_req_ring[wr].mac, info->src_addr, 6);
+      __atomic_store_n(&_otap_req_wr, next, __ATOMIC_RELEASE);
+    }
   }
 
   if (d[0] == ESPNOW_MSG_OTA_STATUS && verified_len >= 6) {
-    _otap_status.status = d[5];
-    memcpy((void *)_otap_status.mac, info->src_addr, 6);
-    _otap_status.pending = true;
+    int wr = __atomic_load_n(&_otap_status_wr, __ATOMIC_RELAXED);
+    int next = (wr + 1) % OTAP_RING;
+    if (next != __atomic_load_n(&_otap_status_rd, __ATOMIC_ACQUIRE)) {
+      _otap_status_ring[wr].status = d[5];
+      memcpy(_otap_status_ring[wr].mac, info->src_addr, 6);
+      __atomic_store_n(&_otap_status_wr, next, __ATOMIC_RELEASE);
+    }
   }
 }
 
@@ -224,12 +234,16 @@ static void ota_push_start() {
   Serial.println("[ota-push] offer broadcast, waiting for requests...");
 }
 
-// ---- serve chunks ----------------------------------------------------------
+// FR-07: serve chunks from SPSC ring buffers.
 static void ota_push_tick() {
   if (!_otap.pushing) return;
 
-  if (_otap_req.pending) {
-    uint16_t seq = _otap_req.seq;
+  // Drain request ring.
+  for (;;) {
+    int rd = __atomic_load_n(&_otap_req_rd, __ATOMIC_RELAXED);
+    if (rd == __atomic_load_n(&_otap_req_wr, __ATOMIC_ACQUIRE)) break;
+
+    uint16_t seq = _otap_req_ring[rd].seq;
     if (seq < _otap.n_chunks) {
       uint32_t offset = (uint32_t)seq * _otap.chunk_size;
       uint32_t remaining = _otap.fw_size - offset;
@@ -242,23 +256,26 @@ static void ota_push_tick() {
       frame[7] = dlen;
       memcpy(frame + 8, _otap.fw + offset, dlen);
 
-      // Add requester as peer if not already.
       esp_now_peer_info_t pi = {};
-      memcpy(pi.peer_addr, (void *)_otap_req.mac, 6);
+      memcpy(pi.peer_addr, _otap_req_ring[rd].mac, 6);
       pi.channel = 0; pi.encrypt = false;
       esp_now_add_peer(&pi);
 
-      _otap_send_signed((uint8_t *)_otap_req.mac, frame, 8 + dlen);
+      _otap_send_signed(_otap_req_ring[rd].mac, frame, 8 + dlen);
       _otap.last_served = seq;
 
       if ((seq & 0x3F) == 0 || seq + 1 >= _otap.n_chunks)
         Serial.printf("[ota-push] served %d/%d\n", seq + 1, _otap.n_chunks);
     }
-    _otap_req.pending = false;
+    __atomic_store_n(&_otap_req_rd, (rd + 1) % OTAP_RING, __ATOMIC_RELEASE);
   }
 
-  if (_otap_status.pending) {
-    uint8_t st = _otap_status.status;
+  // Drain status ring.
+  for (;;) {
+    int rd = __atomic_load_n(&_otap_status_rd, __ATOMIC_RELAXED);
+    if (rd == __atomic_load_n(&_otap_status_wr, __ATOMIC_ACQUIRE)) break;
+
+    uint8_t st = _otap_status_ring[rd].status;
     if (st == 1) {
       Serial.println("[ota-push] receiver confirmed update complete!");
       _otap.pushing = false;
@@ -267,14 +284,14 @@ static void ota_push_tick() {
                     st == 0 ? "abort" : "error");
       _otap.pushing = false;
     }
-    _otap_status.pending = false;
+    __atomic_store_n(&_otap_status_rd, (rd + 1) % OTAP_RING, __ATOMIC_RELEASE);
   }
 }
 
 static void ota_push_init() {
   memset(&_otap, 0, sizeof(_otap));
-  memset((void *)&_otap_req, 0, sizeof(_otap_req));
-  memset((void *)&_otap_status, 0, sizeof(_otap_status));
+  _otap_req_wr = _otap_req_rd = 0;
+  _otap_status_wr = _otap_status_rd = 0;
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   _otap.device_id = _otap_crc32(mac, 6);
