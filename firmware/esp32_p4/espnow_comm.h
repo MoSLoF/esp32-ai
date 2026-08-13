@@ -56,6 +56,28 @@ static void espnow_register_peer_handler(espnow_peer_handler_t handler) {
     _espnow_ext[_espnow_n_ext++] = handler;
 }
 
+// Crypto hooks — set via espnow_set_crypto() when USE_CRYPTO is enabled.
+typedef int (*espnow_sign_fn_t)(uint8_t *frame, int len);
+typedef int (*espnow_verify_fn_t)(const uint8_t *frame, int len);
+
+static espnow_sign_fn_t _espnow_sign_fn = NULL;
+static espnow_verify_fn_t _espnow_verify_fn = NULL;
+
+static void espnow_set_crypto(espnow_sign_fn_t sign_fn,
+                                espnow_verify_fn_t verify_fn) {
+  _espnow_sign_fn = sign_fn;
+  _espnow_verify_fn = verify_fn;
+  Serial.println("[espnow] crypto hooks registered");
+}
+
+// Send an extension frame (type >= 0x04) with crypto signing when enabled.
+// Caller's buffer must have room for 12 extra bytes (CRYPTO_OVERHEAD).
+static void espnow_send_secure(const uint8_t *dest, uint8_t *frame, int len) {
+  if (_espnow_sign_fn && len > 0 && frame[0] >= 0x04)
+    len = _espnow_sign_fn(frame, len);
+  esp_now_send(dest, frame, len);
+}
+
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
@@ -76,9 +98,15 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
   // ESPNOW_MSG_TEXT: tokenize on-device (would need the tokenizer on-chip,
   // not practical at this model size). Ignored for now.
 
-  if (type >= 0x04)
+  if (type >= 0x04) {
+    int ext_len = len;
+    if (_espnow_verify_fn) {
+      ext_len = _espnow_verify_fn(data, len);
+      if (ext_len <= 0) return;
+    }
     for (int _h = 0; _h < _espnow_n_ext; _h++)
-      _espnow_ext[_h](info->src_addr, data, len);
+      _espnow_ext[_h](info->src_addr, data, ext_len);
+  }
 }
 
 // Initialize ESP-NOW. WiFi must be in STA mode (no AP needed).

@@ -82,25 +82,25 @@ static int64_t _ota_ms() { return esp_timer_get_time() / 1000; }
 
 // ---- TX helpers ------------------------------------------------------------
 static void _ota_tx_request(uint16_t seq) {
-  uint8_t f[7];
+  uint8_t f[20];
   f[0] = ESPNOW_MSG_OTA_REQUEST;
   uint32_t id = 0;
   { uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
     id = _ota_crc32(0, mac, 6); }
   memcpy(f + 1, &id, 4);
   memcpy(f + 5, &seq, 2);
-  esp_now_send(_ota.sender_mac, f, sizeof(f));
+  espnow_send_secure(_ota.sender_mac, f, 7);
 }
 
 static void _ota_tx_status(uint8_t status) {
-  uint8_t f[6];
+  uint8_t f[20];
   f[0] = ESPNOW_MSG_OTA_STATUS;
   uint32_t id = 0;
   { uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
     id = _ota_crc32(0, mac, 6); }
   memcpy(f + 1, &id, 4);
   f[5] = status;
-  esp_now_send(_ota.sender_mac, f, sizeof(f));
+  espnow_send_secure(_ota.sender_mac, f, 6);
 }
 
 // ---- RX handler ------------------------------------------------------------

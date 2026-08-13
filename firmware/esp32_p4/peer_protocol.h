@@ -173,7 +173,7 @@ static PeerSlot *_pr_alloc(uint32_t id) {
 // ---- frame TX --------------------------------------------------------------
 
 static void _pr_tx_identity() {
-  uint8_t f[32];
+  uint8_t f[48];
   f[0] = ESPNOW_MSG_IDENTITY;
   memcpy(f + 1, &_pr.device_id, 4);
   memcpy(f + 5, &_pr.total_encounters, 2);
@@ -182,7 +182,7 @@ static void _pr_tx_identity() {
   f[11] = 0x01;
   int nlen = strlen(_pr.name);
   memcpy(f + 12, _pr.name, nlen + 1);
-  esp_now_send(ESPNOW_BROADCAST, f, 13 + nlen);
+  espnow_send_secure(ESPNOW_BROADCAST, f, 13 + nlen);
 }
 
 static void _pr_tx_challenge(const uint8_t *mac, const int *prompt, int n,
@@ -197,7 +197,7 @@ static void _pr_tx_challenge(const uint8_t *mac, const int *prompt, int n,
     uint16_t t = (uint16_t)prompt[i];
     memcpy(f + 9 + i * 2, &t, 2);
   }
-  esp_now_send(mac, f, 9 + n * 2);
+  espnow_send_secure(mac, f, 9 + n * 2);
 }
 
 static void _pr_tx_response(const uint8_t *mac, uint16_t cid,
@@ -211,17 +211,17 @@ static void _pr_tx_response(const uint8_t *mac, uint16_t cid,
     uint16_t t = (uint16_t)tok[i];
     memcpy(f + 8 + i * 2, &t, 2);
   }
-  esp_now_send(mac, f, 8 + n * 2);
+  espnow_send_secure(mac, f, 8 + n * 2);
 }
 
 static void _pr_tx_validate(const uint8_t *mac, uint16_t cid, bool pass) {
-  uint8_t f[10];
+  uint8_t f[24];
   f[0] = ESPNOW_MSG_VALIDATE;
   memcpy(f + 1, &_pr.device_id, 4);
   memcpy(f + 5, &cid, 2);
   f[7] = pass ? 1 : 0;
   memcpy(f + 8, &_pr.total_bonds, 2);
-  esp_now_send(mac, f, 10);
+  espnow_send_secure(mac, f, 10);
 }
 
 // ---- RX handler (called from espnow_comm.h) --------------------------------

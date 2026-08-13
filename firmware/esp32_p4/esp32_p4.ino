@@ -312,6 +312,9 @@ void setup() {
 #endif
 #if USE_CRYPTO
   crypto_init();
+#if USE_ESPNOW
+  espnow_set_crypto(crypto_sign, crypto_verify);
+#endif
 #endif
 
   // Cap head rows to the trained vocab BEFORE staging.

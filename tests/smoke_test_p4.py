@@ -74,6 +74,7 @@ GUARDED_SYMBOLS = {
     "ota_tick":       "USE_OTA",
     "mesh_init":      "USE_MESH",
     "crypto_init":    "USE_CRYPTO",
+    "espnow_set_crypto": "USE_CRYPTO",
     "companion_begin":"USE_COMPANION",
     "companion_tick": "USE_COMPANION",
 }
@@ -334,6 +335,39 @@ def test_crypto_replay_protection():
     assert crypto is not None
     assert "CRYPTO_MAX_DRIFT" in crypto
     assert "CRYPTO_TS_LEN" in crypto
+
+
+def test_crypto_wired_to_espnow():
+    """Crypto sign/verify must be wired into ESP-NOW via hooks."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "espnow_set_crypto" in ino, (
+        "esp32_p4.ino must call espnow_set_crypto to wire crypto into ESP-NOW"
+    )
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "espnow_set_crypto" in en
+    assert "espnow_send_secure" in en
+    assert "_espnow_verify_fn" in en
+
+
+def test_extension_frames_use_secure_send():
+    """Peer protocol, OTA, and mesh TX must use espnow_send_secure."""
+    for header in ["peer_protocol.h", "ota_espnow.h", "mesh_relay.h"]:
+        content = read_file(header)
+        assert content is not None, f"{header} not found"
+        assert "espnow_send_secure" in content, (
+            f"{header} must use espnow_send_secure for signed frame TX"
+        )
+
+
+def test_mesh_rejects_nested_relay():
+    """mesh_relay.h must reject nested relay frames to prevent stack overflow."""
+    mesh = read_file("mesh_relay.h")
+    assert mesh is not None
+    assert "_mesh_dispatching" in mesh, (
+        "mesh_relay.h must have re-entrant dispatch guard"
+    )
 
 
 if __name__ == "__main__":

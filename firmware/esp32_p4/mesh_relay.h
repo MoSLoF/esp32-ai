@@ -68,7 +68,7 @@ static void mesh_init(uint32_t self_id) {
 
 // Wrap a payload in a relay envelope and broadcast.
 static void mesh_send(const uint8_t *payload, int len) {
-  if (!_mesh_ready || len < 1 || len > 240) return;
+  if (!_mesh_ready || len < 1 || len > 230) return;
   // Only relay peer-protocol and higher frames.
   if (payload[0] < 0x04) return;
 
@@ -80,7 +80,7 @@ static void mesh_send(const uint8_t *payload, int len) {
   memcpy(frame + 6, &seq, 2);
   memcpy(frame + 8, payload, len);
   _mesh_mark_seen(_mesh_self_id, seq);
-  esp_now_send(ESPNOW_BROADCAST, frame, 8 + len);
+  espnow_send_secure(ESPNOW_BROADCAST, frame, 8 + len);
 }
 
 // Handle an incoming relay frame. Returns the inner payload length (>0)
@@ -100,14 +100,12 @@ static int mesh_rx(const uint8_t *data, int len,
   if (_mesh_is_seen(origin, seq)) return 0;
   _mesh_mark_seen(origin, seq);
 
-  // Re-broadcast with decremented TTL.
-  if (ttl > 1) {
+  // Re-broadcast with decremented TTL (re-signed by espnow_send_secure).
+  if (ttl > 1 && len <= 238) {
     uint8_t fwd[250];
-    int fwd_len = len;
-    if (fwd_len > 250) fwd_len = 250;
-    memcpy(fwd, data, fwd_len);
+    memcpy(fwd, data, len);
     fwd[1] = ttl - 1;
-    esp_now_send(ESPNOW_BROADCAST, fwd, fwd_len);
+    espnow_send_secure(ESPNOW_BROADCAST, fwd, len);
   }
 
   *inner_out = data + 8;
@@ -119,16 +117,23 @@ static void _mesh_espnow_handler(const uint8_t *mac,
                                    const uint8_t *data, int len) {
   if (len < 1 || data[0] != ESPNOW_MSG_RELAY) return;
 
+  // Prevent re-entrant dispatch (stack overflow from nested relay frames).
+  static bool _mesh_dispatching = false;
+  if (_mesh_dispatching) return;
+
   const uint8_t *inner;
   int inner_len = mesh_rx(data, len, &inner);
   if (inner_len <= 0) return;
 
-  // Dispatch the inner frame to the existing handler chain.
-  // The inner payload starts with a standard frame type byte.
+  // Reject nested relay frames — inner payload must not be another relay.
+  if (inner[0] == ESPNOW_MSG_RELAY) return;
+
+  _mesh_dispatching = true;
   extern espnow_peer_handler_t _espnow_ext[];
   extern int _espnow_n_ext;
   for (int h = 0; h < _espnow_n_ext; h++)
     _espnow_ext[h](mac, inner, inner_len);
+  _mesh_dispatching = false;
 }
 
 #endif
