@@ -288,6 +288,12 @@ void loop() {
     cmd.trim();
 #if USE_PEER_PROTOCOL
     if (cmd == "status" || cmd == "peers") peer_print_status();
+    else if (cmd == "identity") persona_print_roster();
+    else if (cmd.startsWith("identity ")) {
+      int idx = cmd.substring(9).toInt();
+      persona_select(idx);
+      persona_boot();
+    }
 #endif
   }
 #if USE_PEER_PROTOCOL

@@ -35,6 +35,7 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <string.h>
+#include "peer_identity.h"
 
 #define ESPNOW_MSG_IDENTITY  0x04
 #define ESPNOW_MSG_CHALLENGE 0x05
@@ -323,12 +324,14 @@ static void peer_init(peer_infer_fn_t infer) {
 
   espnow_register_peer_handler(_pr_rx);
 
+  persona_auto(_pr.device_id);
   _pr.ready = true;
   Serial.printf("\n--- peer protocol ---\n");
   Serial.printf("identity: %s (0x%08X)\n", _pr.name, _pr.device_id);
   Serial.printf("history: %d encounters, %d bonds\n",
                 _pr.total_encounters, _pr.total_bonds);
-  Serial.println("scanning for peers...\n");
+  persona_boot();
+  Serial.printf("  %s  scanning for peers...\n\n", persona()->face_scanning);
 }
 
 static void peer_tick() {
@@ -356,8 +359,10 @@ static void peer_tick() {
         esp_now_add_peer(&pi);
         _pr.total_encounters++;
         _pr_save();
+        Serial.printf("  %s\n", persona()->face_found);
         Serial.printf("[!] discovered: %s (0x%08X)\n",
                       p->name, p->device_id);
+        Serial.printf("    %s\n", persona()->quip_discover);
       }
     }
     if (p) p->last_seen = now;
@@ -376,7 +381,8 @@ static void peer_tick() {
         : (int)((h + 1) % N_CHAL_BANK);
     const int *prompt = CHALLENGE_BANK[idx];
 
-    Serial.printf("[>] challenging %s...\n", p->name);
+    Serial.printf("[>] challenging %s...  %s\n",
+                  p->name, persona()->quip_challenge);
     p->n_expected = _pr.infer(prompt, PEER_PROMPT_LEN,
                                PEER_RESP_LEN, p->expected);
     p->challenge_id = _pr.next_cid++;
@@ -419,6 +425,8 @@ static void peer_tick() {
 
       if (pass) {
         p->i_validated = true;
+        Serial.printf("  %s  %s\n", persona()->face_found,
+                      persona()->quip_verified);
         Serial.printf("[*] %s VERIFIED (%d/%d tokens match)\n",
                       p->name, match, n);
         if (p->they_validated && !p->bonded) {
@@ -426,10 +434,14 @@ static void peer_tick() {
           p->bond_count++;
           _pr.total_bonds++;
           _pr_save();
+          Serial.printf("  %s  %s\n", persona()->face_bonded,
+                        persona()->quip_bonded);
           Serial.printf("[**] BONDED with %s! (bond #%d)\n",
                         p->name, _pr.total_bonds);
         }
       } else {
+        Serial.printf("  %s  %s\n", persona()->face_rejected,
+                      persona()->quip_failed);
         Serial.printf("[x] %s FAILED validation (%d/%d match)\n",
                       p->name, match, n);
       }
@@ -448,10 +460,14 @@ static void peer_tick() {
         p->bond_count++;
         _pr.total_bonds++;
         _pr_save();
+        Serial.printf("  %s  %s\n", persona()->face_bonded,
+                      persona()->quip_bonded);
         Serial.printf("[**] BONDED with %s! (bond #%d)\n",
                       p->name, _pr.total_bonds);
       }
     } else if (p) {
+      Serial.printf("  %s  %s\n", persona()->face_rejected,
+                    persona()->quip_failed);
       Serial.printf("[x] %s rejected our response\n", p->name);
     }
     _prv.pending = false;
@@ -462,7 +478,8 @@ static void peer_tick() {
     PeerSlot *p = &_pr_peers[i];
     if (!p->active || !p->challenge_sent || p->i_validated) continue;
     if (now - p->challenge_time > PEER_CHALLENGE_TIMEOUT) {
-      Serial.printf("[?] challenge to %s timed out, retrying\n", p->name);
+      Serial.printf("[?] challenge to %s timed out, retrying  %s\n",
+                    p->name, persona()->quip_timeout);
       p->challenge_sent = false;
     }
   }
@@ -476,14 +493,20 @@ static void peer_tick() {
       if (_pr_peers[i].bonded) nb++;
     }
     if (na > 0)
-      Serial.printf("--- %s | peers: %d | bonded: %d | lifetime: %d ---\n",
-                    _pr.name, na, nb, _pr.total_bonds);
+      Serial.printf("--- %s %s | peers: %d | bonded: %d | lifetime: %d ---\n",
+                    persona()->face_idle, _pr.name, na, nb, _pr.total_bonds);
+    else
+      Serial.printf("--- %s %s  %s ---\n",
+                    persona()->face_scanning, _pr.name,
+                    persona()->quip_lonely);
     _pr.last_status = now;
   }
 }
 
 static void peer_print_status() {
-  Serial.printf("\n=== %s (0x%08X) ===\n", _pr.name, _pr.device_id);
+  Serial.printf("\n=== %s  %s (0x%08X) ===\n",
+                persona()->face_idle, _pr.name, _pr.device_id);
+  Serial.printf("persona: %s \"%s\"\n", persona()->name, persona()->title);
   Serial.printf("encounters: %d  bonds: %d\n\n",
                 _pr.total_encounters, _pr.total_bonds);
   bool any = false;
