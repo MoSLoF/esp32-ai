@@ -11,6 +11,7 @@
 //   0x09 OTA_REQUEST { type, device_id:u32, chunk_seq:u16 }
 //   0x0A OTA_DATA    { type, sender_id:u32, chunk_seq:u16, len:u8, data[] }
 //   0x0B OTA_STATUS  { type, device_id:u32, status:u8 }
+//   0x0C OTA_MANIFEST (handled by ota_verify.h)
 //
 // Requires the OTA partition table (partitions_ota.csv) with ota_0/ota_1.
 // Enable with USE_OTA 1 in the main sketch (implies USE_ESPNOW).
@@ -34,7 +35,7 @@
 #define OTA_STATUS_ERROR    2
 #define OTA_STATUS_ACCEPT   3
 
-#define OTA_CHUNK_SIZE      230
+#define OTA_CHUNK_SIZE      226
 #define OTA_REQ_TIMEOUT_MS  3000
 #define OTA_MAX_RETRIES     15
 #define OTA_OFFER_COOLDOWN  30000
@@ -60,15 +61,27 @@ static struct {
   bool ready;
 } _ota;
 
-// ---- incoming frame buffers ------------------------------------------------
-static volatile struct {
-  bool pending; uint32_t id; uint8_t mac[6];
-  uint32_t fw_size; uint16_t n_chunks; uint32_t crc; uint16_t chunk_size;
-} _ota_in_offer;
+// ---- SPSC ring buffers (EA-09) ---------------------------------------------
+#define OTA_RX_RING 4
 
-static volatile struct {
-  bool pending; uint16_t seq; uint8_t len; uint8_t data[OTA_CHUNK_SIZE];
-} _ota_in_data;
+static struct {
+  uint32_t id; uint8_t mac[6];
+  uint32_t fw_size; uint16_t n_chunks; uint32_t crc; uint16_t chunk_size;
+} _ota_offer_ring[OTA_RX_RING];
+static int _ota_offer_wr = 0, _ota_offer_rd = 0;
+
+static struct {
+  uint16_t seq; uint8_t len; uint8_t data[OTA_CHUNK_SIZE];
+} _ota_data_ring[OTA_RX_RING];
+static int _ota_data_wr = 0, _ota_data_rd = 0;
+
+#ifdef OTA_VERIFY_H
+static struct {
+  uint8_t payload[sizeof(OtaManifest) + 1];
+  int len;
+} _ota_manifest_ring[OTA_RX_RING];
+static int _ota_manifest_wr = 0, _ota_manifest_rd = 0;
+#endif
 
 // ---- CRC32 -----------------------------------------------------------------
 static uint32_t _ota_crc32(uint32_t prev, const uint8_t *d, int n) {
@@ -105,7 +118,7 @@ static void _ota_tx_status(uint8_t status) {
   espnow_send_secure(_ota.sender_mac, f, 6);
 }
 
-// ---- RX handler ------------------------------------------------------------
+// ---- RX handler (EA-09: SPSC ring buffers) ---------------------------------
 static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
   if (len < 5) return;
   uint8_t type = d[0];
@@ -113,13 +126,17 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
   switch (type) {
   case ESPNOW_MSG_OTA_OFFER:
     if (len >= 17 && _ota.state == OTA_IDLE) {
-      memcpy((void *)&_ota_in_offer.id, d + 1, 4);
-      memcpy((void *)&_ota_in_offer.fw_size, d + 5, 4);
-      memcpy((void *)&_ota_in_offer.n_chunks, d + 9, 2);
-      memcpy((void *)&_ota_in_offer.crc, d + 11, 4);
-      memcpy((void *)&_ota_in_offer.chunk_size, d + 15, 2);
-      memcpy((void *)_ota_in_offer.mac, mac, 6);
-      _ota_in_offer.pending = true;
+      int wr = __atomic_load_n(&_ota_offer_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % OTA_RX_RING;
+      if (next != __atomic_load_n(&_ota_offer_rd, __ATOMIC_ACQUIRE)) {
+        memcpy(&_ota_offer_ring[wr].id, d + 1, 4);
+        memcpy(&_ota_offer_ring[wr].fw_size, d + 5, 4);
+        memcpy(&_ota_offer_ring[wr].n_chunks, d + 9, 2);
+        memcpy(&_ota_offer_ring[wr].crc, d + 11, 4);
+        memcpy(&_ota_offer_ring[wr].chunk_size, d + 15, 2);
+        memcpy(_ota_offer_ring[wr].mac, mac, 6);
+        __atomic_store_n(&_ota_offer_wr, next, __ATOMIC_RELEASE);
+      }
     }
     break;
 
@@ -129,12 +146,32 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
       uint8_t dlen = d[7];
       if (dlen > OTA_CHUNK_SIZE) dlen = OTA_CHUNK_SIZE;
       if (len < 8 + dlen) break;
-      _ota_in_data.seq = seq;
-      _ota_in_data.len = dlen;
-      memcpy((void *)_ota_in_data.data, d + 8, dlen);
-      _ota_in_data.pending = true;
+      int wr = __atomic_load_n(&_ota_data_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % OTA_RX_RING;
+      if (next != __atomic_load_n(&_ota_data_rd, __ATOMIC_ACQUIRE)) {
+        _ota_data_ring[wr].seq = seq;
+        _ota_data_ring[wr].len = dlen;
+        memcpy(_ota_data_ring[wr].data, d + 8, dlen);
+        __atomic_store_n(&_ota_data_wr, next, __ATOMIC_RELEASE);
+      }
     }
     break;
+
+#ifdef OTA_VERIFY_H
+  case ESPNOW_MSG_OTA_MANIFEST:
+    if (len >= 2 && _ota.state == OTA_IDLE) {
+      int payload_len = len - 1;
+      if (payload_len > (int)sizeof(OtaManifest)) payload_len = sizeof(OtaManifest);
+      int wr = __atomic_load_n(&_ota_manifest_wr, __ATOMIC_RELAXED);
+      int next = (wr + 1) % OTA_RX_RING;
+      if (next != __atomic_load_n(&_ota_manifest_rd, __ATOMIC_ACQUIRE)) {
+        memcpy(_ota_manifest_ring[wr].payload, d + 1, payload_len);
+        _ota_manifest_ring[wr].len = payload_len;
+        __atomic_store_n(&_ota_manifest_wr, next, __ATOMIC_RELEASE);
+      }
+    }
+    break;
+#endif
   }
 }
 
@@ -142,8 +179,11 @@ static void _ota_rx(const uint8_t *mac, const uint8_t *d, int len) {
 
 static void ota_init() {
   memset(&_ota, 0, sizeof(_ota));
-  memset((void *)&_ota_in_offer, 0, sizeof(_ota_in_offer));
-  memset((void *)&_ota_in_data, 0, sizeof(_ota_in_data));
+  _ota_offer_wr = _ota_offer_rd = 0;
+  _ota_data_wr = _ota_data_rd = 0;
+#ifdef OTA_VERIFY_H
+  _ota_manifest_wr = _ota_manifest_rd = 0;
+#endif
   espnow_register_peer_handler(_ota_rx);
   _ota.ready = true;
   Serial.println("OTA receiver ready");
@@ -153,115 +193,178 @@ static void ota_tick() {
   if (!_ota.ready) return;
   int64_t now = _ota_ms();
 
+#ifdef OTA_VERIFY_H
+  // Process manifest frames.
+  for (;;) {
+    int rd = __atomic_load_n(&_ota_manifest_rd, __ATOMIC_RELAXED);
+    if (rd == __atomic_load_n(&_ota_manifest_wr, __ATOMIC_ACQUIRE)) break;
+    ota_verify_manifest(_ota_manifest_ring[rd].payload,
+                        _ota_manifest_ring[rd].len);
+    __atomic_store_n(&_ota_manifest_rd, (rd + 1) % OTA_RX_RING,
+                     __ATOMIC_RELEASE);
+  }
+#endif
+
   // Process OTA offer (with cooldown to prevent DoS via repeated offers).
-  if (_ota_in_offer.pending && _ota.state == OTA_IDLE) {
-    if (now - _ota.last_offer_time < OTA_OFFER_COOLDOWN) {
-      _ota_in_offer.pending = false;
-      return;
+  {
+    int rd = __atomic_load_n(&_ota_offer_rd, __ATOMIC_RELAXED);
+    if (rd != __atomic_load_n(&_ota_offer_wr, __ATOMIC_ACQUIRE)
+        && _ota.state == OTA_IDLE) {
+      if (now - _ota.last_offer_time < OTA_OFFER_COOLDOWN) {
+        __atomic_store_n(&_ota_offer_rd, (rd + 1) % OTA_RX_RING,
+                         __ATOMIC_RELEASE);
+        return;
+      }
+
+      uint32_t offer_fw_size = _ota_offer_ring[rd].fw_size;
+
+#ifdef OTA_VERIFY_H
+      // EA-01: require verified manifest before accepting OTA offer.
+      if (!ota_verify_has_manifest(offer_fw_size)) {
+        Serial.println("[ota] offer rejected: no verified manifest");
+        __atomic_store_n(&_ota_offer_rd, (rd + 1) % OTA_RX_RING,
+                         __ATOMIC_RELEASE);
+        return;
+      }
+#endif
+
+      _ota.last_offer_time = now;
+      _ota.sender_id = _ota_offer_ring[rd].id;
+      memcpy(_ota.sender_mac, _ota_offer_ring[rd].mac, 6);
+      _ota.fw_size = offer_fw_size;
+      _ota.n_chunks = _ota_offer_ring[rd].n_chunks;
+      _ota.expected_crc = _ota_offer_ring[rd].crc;
+      _ota.chunk_size = _ota_offer_ring[rd].chunk_size;
+      if (_ota.chunk_size > OTA_CHUNK_SIZE) _ota.chunk_size = OTA_CHUNK_SIZE;
+
+      __atomic_store_n(&_ota_offer_rd, (rd + 1) % OTA_RX_RING,
+                       __ATOMIC_RELEASE);
+
+      // Add sender as ESP-NOW peer for unicast.
+      esp_now_peer_info_t pi = {};
+      memcpy(pi.peer_addr, _ota.sender_mac, 6);
+      pi.channel = 0; pi.encrypt = false;
+      esp_now_add_peer(&pi);
+
+      // Open OTA partition.
+      _ota.part = esp_ota_get_next_update_partition(NULL);
+      if (!_ota.part) {
+        Serial.println("[ota] no OTA partition found");
+        return;
+      }
+      esp_err_t e = esp_ota_begin(_ota.part, _ota.fw_size, &_ota.handle);
+      if (e != ESP_OK) {
+        Serial.printf("[ota] esp_ota_begin failed: %d\n", e);
+        return;
+      }
+
+      _ota.state = OTA_ACTIVE;
+      _ota.next_seq = 0;
+      _ota.written = 0;
+      _ota.crc = 0;
+      _ota.retries = 0;
+
+#ifdef OTA_VERIFY_H
+      ota_verify_sha_begin();
+#endif
+
+      Serial.printf("[ota] accepted: %u bytes, %d chunks from 0x%08X\n",
+                    _ota.fw_size, _ota.n_chunks, _ota.sender_id);
+      _ota_tx_status(OTA_STATUS_ACCEPT);
+      _ota_tx_request(0);
+      _ota.last_req = now;
+    } else if (rd != __atomic_load_n(&_ota_offer_wr, __ATOMIC_ACQUIRE)) {
+      // Drain stale offers while not idle.
+      __atomic_store_n(&_ota_offer_rd, (rd + 1) % OTA_RX_RING,
+                       __ATOMIC_RELEASE);
     }
-    _ota.last_offer_time = now;
-    _ota.sender_id = _ota_in_offer.id;
-    memcpy(_ota.sender_mac, (void *)_ota_in_offer.mac, 6);
-    _ota.fw_size = _ota_in_offer.fw_size;
-    _ota.n_chunks = _ota_in_offer.n_chunks;
-    _ota.expected_crc = _ota_in_offer.crc;
-    _ota.chunk_size = _ota_in_offer.chunk_size;
-    if (_ota.chunk_size > OTA_CHUNK_SIZE) _ota.chunk_size = OTA_CHUNK_SIZE;
-
-    // Add sender as ESP-NOW peer for unicast.
-    esp_now_peer_info_t pi = {};
-    memcpy(pi.peer_addr, _ota.sender_mac, 6);
-    pi.channel = 0; pi.encrypt = false;
-    esp_now_add_peer(&pi);
-
-    // Open OTA partition.
-    _ota.part = esp_ota_get_next_update_partition(NULL);
-    if (!_ota.part) {
-      Serial.println("[ota] no OTA partition found");
-      _ota_in_offer.pending = false;
-      return;
-    }
-    esp_err_t e = esp_ota_begin(_ota.part, _ota.fw_size, &_ota.handle);
-    if (e != ESP_OK) {
-      Serial.printf("[ota] esp_ota_begin failed: %d\n", e);
-      _ota_in_offer.pending = false;
-      return;
-    }
-
-    _ota.state = OTA_ACTIVE;
-    _ota.next_seq = 0;
-    _ota.written = 0;
-    _ota.crc = 0;
-    _ota.retries = 0;
-
-    Serial.printf("[ota] accepted: %u bytes, %d chunks from 0x%08X\n",
-                  _ota.fw_size, _ota.n_chunks, _ota.sender_id);
-    _ota_tx_status(OTA_STATUS_ACCEPT);
-    _ota_tx_request(0);
-    _ota.last_req = now;
-    _ota_in_offer.pending = false;
   }
 
   if (_ota.state != OTA_ACTIVE) {
-    _ota_in_offer.pending = false;
-    _ota_in_data.pending = false;
+    // Drain any stale data frames.
+    int rd = __atomic_load_n(&_ota_data_rd, __ATOMIC_RELAXED);
+    if (rd != __atomic_load_n(&_ota_data_wr, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&_ota_data_rd, (rd + 1) % OTA_RX_RING,
+                       __ATOMIC_RELEASE);
     return;
   }
 
   // Process data chunk.
-  if (_ota_in_data.pending) {
-    if (_ota_in_data.seq == _ota.next_seq) {
-      uint8_t dlen = _ota_in_data.len;
-      esp_err_t e = esp_ota_write(_ota.handle,
-                                   (void *)_ota_in_data.data, dlen);
-      if (e != ESP_OK) {
-        Serial.printf("[ota] write failed at chunk %d: %d\n",
-                      _ota.next_seq, e);
-        _ota_tx_status(OTA_STATUS_ERROR);
-        esp_ota_abort(_ota.handle);
-        _ota.state = OTA_IDLE;
-        _ota_in_data.pending = false;
-        return;
-      }
-      _ota.crc = _ota_crc32(_ota.crc, (uint8_t *)_ota_in_data.data, dlen);
-      _ota.written += dlen;
-      _ota.next_seq++;
-      _ota.retries = 0;
-
-      if ((_ota.next_seq & 0x3F) == 0 || _ota.next_seq >= _ota.n_chunks)
-        Serial.printf("[ota] %d/%d chunks  (%u/%u bytes)\n",
-                      _ota.next_seq, _ota.n_chunks,
-                      _ota.written, _ota.fw_size);
-
-      if (_ota.next_seq >= _ota.n_chunks) {
-        // All chunks received — verify and finalize.
-        if (_ota.crc != _ota.expected_crc) {
-          Serial.printf("[ota] CRC mismatch: got 0x%08X, expected 0x%08X\n",
-                        _ota.crc, _ota.expected_crc);
+  {
+    int rd = __atomic_load_n(&_ota_data_rd, __ATOMIC_RELAXED);
+    if (rd != __atomic_load_n(&_ota_data_wr, __ATOMIC_ACQUIRE)) {
+      if (_ota_data_ring[rd].seq == _ota.next_seq) {
+        uint8_t dlen = _ota_data_ring[rd].len;
+        esp_err_t e = esp_ota_write(_ota.handle,
+                                     _ota_data_ring[rd].data, dlen);
+        if (e != ESP_OK) {
+          Serial.printf("[ota] write failed at chunk %d: %d\n",
+                        _ota.next_seq, e);
           _ota_tx_status(OTA_STATUS_ERROR);
           esp_ota_abort(_ota.handle);
           _ota.state = OTA_IDLE;
-        } else {
-          esp_err_t e2 = esp_ota_end(_ota.handle);
-          if (e2 != ESP_OK) {
-            Serial.printf("[ota] esp_ota_end failed: %d\n", e2);
+#ifdef OTA_VERIFY_H
+          ota_verify_reset();
+#endif
+          __atomic_store_n(&_ota_data_rd, (rd + 1) % OTA_RX_RING,
+                           __ATOMIC_RELEASE);
+          return;
+        }
+        _ota.crc = _ota_crc32(_ota.crc, _ota_data_ring[rd].data, dlen);
+#ifdef OTA_VERIFY_H
+        ota_verify_sha_update(_ota_data_ring[rd].data, dlen);
+#endif
+        _ota.written += dlen;
+        _ota.next_seq++;
+        _ota.retries = 0;
+
+        if ((_ota.next_seq & 0x3F) == 0 || _ota.next_seq >= _ota.n_chunks)
+          Serial.printf("[ota] %d/%d chunks  (%u/%u bytes)\n",
+                        _ota.next_seq, _ota.n_chunks,
+                        _ota.written, _ota.fw_size);
+
+        if (_ota.next_seq >= _ota.n_chunks) {
+          // All chunks received — verify and finalize.
+          bool crc_ok = (_ota.crc == _ota.expected_crc);
+#ifdef OTA_VERIFY_H
+          bool sha_ok = ota_verify_sha_finish();
+#else
+          bool sha_ok = true;
+#endif
+          if (!crc_ok) {
+            Serial.printf("[ota] CRC mismatch: got 0x%08X, expected 0x%08X\n",
+                          _ota.crc, _ota.expected_crc);
             _ota_tx_status(OTA_STATUS_ERROR);
+            esp_ota_abort(_ota.handle);
+            _ota.state = OTA_IDLE;
+          } else if (!sha_ok) {
+            Serial.println("[ota] SHA-256 verification failed");
+            _ota_tx_status(OTA_STATUS_ERROR);
+            esp_ota_abort(_ota.handle);
             _ota.state = OTA_IDLE;
           } else {
-            esp_ota_set_boot_partition(_ota.part);
-            _ota_tx_status(OTA_STATUS_COMPLETE);
-            Serial.println("[ota] update complete, rebooting in 2s...");
-            _ota.state = OTA_DONE;
-            delay(2000);
-            esp_restart();
+            esp_err_t e2 = esp_ota_end(_ota.handle);
+            if (e2 != ESP_OK) {
+              Serial.printf("[ota] esp_ota_end failed: %d\n", e2);
+              _ota_tx_status(OTA_STATUS_ERROR);
+              _ota.state = OTA_IDLE;
+            } else {
+              esp_ota_set_boot_partition(_ota.part);
+              _ota_tx_status(OTA_STATUS_COMPLETE);
+              Serial.println("[ota] update complete, rebooting in 2s...");
+              _ota.state = OTA_DONE;
+              delay(2000);
+              esp_restart();
+            }
           }
+        } else {
+          _ota_tx_request(_ota.next_seq);
+          _ota.last_req = now;
         }
-      } else {
-        _ota_tx_request(_ota.next_seq);
-        _ota.last_req = now;
       }
+      __atomic_store_n(&_ota_data_rd, (rd + 1) % OTA_RX_RING,
+                       __ATOMIC_RELEASE);
     }
-    _ota_in_data.pending = false;
   }
 
   // Timeout — re-request current chunk.
@@ -273,6 +376,9 @@ static void ota_tick() {
       _ota_tx_status(OTA_STATUS_ABORT);
       esp_ota_abort(_ota.handle);
       _ota.state = OTA_IDLE;
+#ifdef OTA_VERIFY_H
+      ota_verify_reset();
+#endif
     } else {
       _ota_tx_request(_ota.next_seq);
       _ota.last_req = now;

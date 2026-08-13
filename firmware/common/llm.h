@@ -68,20 +68,31 @@ typedef struct {
 } Model;
 
 // Advance a cursor over the file, binding one quant tensor. Reads the per-tensor
-// group prefix, then ragged codes + fp16 scales.
-static const uint8_t *bind_q(const uint8_t *p, QT *t, int rows, int cols) {
+// group prefix, then ragged codes + fp16 scales. Returns NULL if the tensor
+// extends past `end`.
+static const uint8_t *bind_q(const uint8_t *p, const uint8_t *end,
+                              QT *t, int rows, int cols) {
+  if (!p || p + 4 > end) return NULL;
   int32_t group; memcpy(&group, p, 4); p += 4;
+  if (group <= 0 || group > cols) return NULL;
   t->rows = rows; t->cols = cols; t->group = group;
   t->n_groups = (cols + group - 1) / group;
   t->row_bytes = (cols + 1) / 2;
-  t->codes = p;  p += (size_t)rows * t->row_bytes;
-  // Ensure 2-byte alignment for scales (Xtensa traps; RISC-V handles but slower).
+  size_t codes_sz = (size_t)rows * t->row_bytes;
+  if (p + codes_sz > end) return NULL;
+  t->codes = p;  p += codes_sz;
   if ((uintptr_t)p & 1) p++;
-  t->scales = (const uint16_t *)p;  p += (size_t)rows * t->n_groups * 2;
+  size_t scales_sz = (size_t)rows * t->n_groups * 2;
+  if (p + scales_sz > end) return NULL;
+  t->scales = (const uint16_t *)p;  p += scales_sz;
   return p;
 }
-static const uint8_t *bind_f(const uint8_t *p, const float **t, int n) {
-  *t = (const float *)p;  return p + (size_t)n * sizeof(float);
+static const uint8_t *bind_f(const uint8_t *p, const uint8_t *end,
+                              const float **t, int n) {
+  if (!p) return NULL;
+  size_t sz = (size_t)n * sizeof(float);
+  if (p + sz > end) return NULL;
+  *t = (const float *)p;  return p + sz;
 }
 
 // Dequantize row r of a quant tensor into out[cols].
@@ -216,36 +227,53 @@ static inline void rmsnorm(const float *x, const float *w, int n, float *out) {
 static inline float gelu(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678f)); }
 static inline float silu(float x) { return x / (1.f + expf(-x)); }
 
-// Parse header + bind all tensors. Returns 0 on ok, -1 on bad magic.
-static int llm_load(const uint8_t *base, Model *m) {
+// Parse header + bind all tensors. Returns 0 on ok, negative on error.
+// buf_len bounds all tensor bindings against the input buffer.
+static int llm_load(const uint8_t *base, size_t buf_len, Model *m) {
+  if (buf_len < 40) return -1;
+  const uint8_t *end = base + buf_len;
   const uint8_t *p = base;
   uint32_t magic; memcpy(&magic, p, 4); p += 4;
   if (magic != LLM_MAGIC) return -1;
   int32_t hv[8]; memcpy(hv, p, 32); p += 32;
   m->c.vocab = hv[0]; m->c.dim = hv[1]; m->c.n_layers = hv[2]; m->c.n_heads = hv[3];
   m->c.ffn = hv[4]; m->c.ple_dim = hv[5]; m->c.seq_len = hv[6]; m->c.group = hv[7];
-  if (m->c.n_layers < 0 || m->c.n_layers > 32) return -1;
+
+  int V = m->c.vocab, D = m->c.dim, L = m->c.n_layers, H = m->c.n_heads;
+  int F = m->c.ffn, P = m->c.ple_dim, S = m->c.seq_len, G = m->c.group;
+  if (V <= 0 || V > 65536) return -2;
+  if (D <= 0 || D > 4096)  return -2;
+  if (L < 0  || L > 32)    return -2;
+  if (H <= 0 || H > 256)   return -2;
+  if (D % H != 0)          return -2;
+  if (F <= 0 || F > 16384) return -2;
+  if (P <= 0 || P > 4096)  return -2;
+  if (S <= 0 || S > 8192)  return -2;
+  if (G <= 0 || G > 1024)  return -2;
+  // Overflow check on combined dimensions used in tensor binding.
+  if ((size_t)L * P > 1048576) return -2;
+
   memcpy(&m->c.rope_theta, p, 4); p += 4;
   m->head_matvec = NULL;
-  int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn, V = m->c.vocab;
 
-  p = bind_q(p, &m->tok_emb, V, D);
-  p = bind_q(p, &m->ple_model_proj, L * P, D);
-  p = bind_f(p, &m->ple_proj_norm, P);
-  p = bind_q(p, &m->ple_table, V, L * P);
+  p = bind_q(p, end, &m->tok_emb, V, D);
+  p = bind_q(p, end, &m->ple_model_proj, L * P, D);
+  p = bind_f(p, end, &m->ple_proj_norm, P);
+  p = bind_q(p, end, &m->ple_table, V, L * P);
   for (int i = 0; i < L; i++) {
-    p = bind_f(p, &m->attn_norm[i], D);
-    p = bind_q(p, &m->qkv[i], 3 * D, D);
-    p = bind_q(p, &m->attn_proj[i], D, D);
-    p = bind_f(p, &m->ffn_norm[i], D);
-    p = bind_q(p, &m->gate[i], F, D);
-    p = bind_q(p, &m->up[i], F, D);
-    p = bind_q(p, &m->down[i], D, F);
-    p = bind_q(p, &m->ple_gate[i], P, D);
-    p = bind_q(p, &m->ple_proj[i], D, P);
-    p = bind_f(p, &m->ple_norm[i], D);
+    p = bind_f(p, end, &m->attn_norm[i], D);
+    p = bind_q(p, end, &m->qkv[i], 3 * D, D);
+    p = bind_q(p, end, &m->attn_proj[i], D, D);
+    p = bind_f(p, end, &m->ffn_norm[i], D);
+    p = bind_q(p, end, &m->gate[i], F, D);
+    p = bind_q(p, end, &m->up[i], F, D);
+    p = bind_q(p, end, &m->down[i], D, F);
+    p = bind_q(p, end, &m->ple_gate[i], P, D);
+    p = bind_q(p, end, &m->ple_proj[i], D, P);
+    p = bind_f(p, end, &m->ple_norm[i], D);
   }
-  p = bind_f(p, &m->out_norm, D);
+  p = bind_f(p, end, &m->out_norm, D);
+  if (!p) return -3;
   return 0;
 }
 

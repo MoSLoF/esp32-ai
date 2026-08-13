@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
   int windows = argc > 3 ? atoi(argv[3]) : 8;
 
   size_t n; uint8_t *buf = read_file(bin, &n);
-  Model m; if (llm_load(buf, &m)) { fprintf(stderr, "bad magic\n"); return 1; }
+  Model m; if (llm_load(buf, n, &m)) { fprintf(stderr, "bad model\n"); return 1; }
   int D = m.c.dim, L = m.c.n_layers, P = m.c.ple_dim, F = m.c.ffn, V = m.c.vocab, S = m.c.seq_len;
 
   Scratch s;

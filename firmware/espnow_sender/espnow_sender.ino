@@ -4,6 +4,9 @@
 //
 // Also receives and prints generated tokens broadcast by the P4.
 //
+// EA-04: All TX frames are signed with crypto_envelope.h when USE_CRYPTO
+// is enabled. RX frames are verified before processing.
+//
 // Usage:
 //   1. Flash this to any spare ESP32 board.
 //   2. Open serial monitor at 115200 baud.
@@ -13,7 +16,9 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_mac.h>
+#include <esp_random.h>
 #include "../esp32_llm/vocab.h"   // shared token->text table for decoding RX
+#include "../common/crypto_envelope.h"
 #include "ota_push.h"
 
 #define ESPNOW_MSG_TOKEN  0x01
@@ -22,6 +27,17 @@
 static const uint8_t BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #ifndef ESPNOW_BROADCAST
 #define ESPNOW_BROADCAST BROADCAST
+#endif
+
+// EA-04: sender-side crypto state.
+#ifndef USE_CRYPTO
+#define USE_CRYPTO 1
+#endif
+
+#if USE_CRYPTO
+static const char *_sender_psk = CRYPTO_PSK;
+static uint32_t _sender_epoch = 0;
+static uint32_t _sender_tx_seq = 0;
 #endif
 
 // Hardcoded prompt token tables. In a full system you'd run a tokenizer
@@ -45,11 +61,33 @@ static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 // Peer protocol frame type for passive scanning.
 #define ESPNOW_MSG_IDENTITY 0x04
 
+// EA-04: sign and send a frame.
+static void sender_send(const uint8_t *dest, uint8_t *frame, int len) {
+#if USE_CRYPTO
+  if (len > 0) {
+    uint32_t seq = _sender_tx_seq++;
+    len = crypto_env_sign(_sender_psk, frame, len, _sender_epoch, seq);
+  }
+#endif
+  esp_now_send(dest, frame, len);
+}
+
 // RX callback: print tokens received from the P4, scan for peer beacons,
 // and dispatch OTA frames.
 static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
-  if (data[0] == ESPNOW_MSG_TOKEN && len >= 3) {
+
+  // EA-04: verify incoming frames when crypto is enabled.
+  int verified_len = len;
+#if USE_CRYPTO
+  {
+    uint32_t ep, sq;
+    verified_len = crypto_env_verify(_sender_psk, data, len, &ep, &sq);
+    if (verified_len <= 0) return;
+  }
+#endif
+
+  if (data[0] == ESPNOW_MSG_TOKEN && verified_len >= 3) {
     uint16_t tok;
     memcpy(&tok, data + 1, 2);
     if (tok < VOCAB_N) {
@@ -58,10 +96,10 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
       Serial.write(bytes, blen);
     }
   }
-  if (data[0] == ESPNOW_MSG_IDENTITY && len >= 13) {
+  if (data[0] == ESPNOW_MSG_IDENTITY && verified_len >= 13) {
     uint32_t dev_id;
     memcpy(&dev_id, data + 1, 4);
-    int nlen = len - 12;
+    int nlen = verified_len - 12;
     if (nlen > 16) nlen = 16;
     Serial.printf("\n[scan] peer: %.*s (0x%08X)\n",
                   nlen, (const char *)(data + 12), dev_id);
@@ -70,15 +108,20 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 }
 
 static void send_prompt(const int *ids, int n) {
+  // EA-04: cap prompt length to fit within 250 bytes with crypto envelope.
+#if USE_CRYPTO
+  if (n > 116) n = 116;
+#else
   if (n > 120) n = 120;
-  uint8_t frame[2 + 120 * 2];
+#endif
+  uint8_t frame[2 + 120 * 2 + CRYPTO_ENV_OVERHEAD];
   frame[0] = ESPNOW_MSG_PROMPT;
   frame[1] = (uint8_t)n;
   for (int i = 0; i < n; i++) {
     uint16_t id = (uint16_t)ids[i];
     memcpy(frame + 2 + i * 2, &id, 2);
   }
-  esp_now_send(BROADCAST, frame, 2 + n * 2);
+  sender_send(BROADCAST, frame, 2 + n * 2);
   Serial.printf("\nsent %d tokens via ESP-NOW\n", n);
 }
 
@@ -104,11 +147,21 @@ void setup() {
 
   ota_push_init();
 
+#if USE_CRYPTO
+  _sender_epoch = esp_random();
+  _sender_tx_seq = 0;
+  _otap_epoch = _sender_epoch;
+  _otap_tx_seq = 0;
+  _otap_crypto_enabled = true;
+  Serial.printf("[crypto] HMAC-SHA256 enabled (epoch=0x%08X)\n",
+                _sender_epoch);
+#endif
+
   Serial.println("ready. type a prompt (or number 1-4):");
   for (int i = 0; i < N_PROMPTS; i++)
     Serial.printf("  %d: \"%s\"\n", i + 1, PROMPTS[i].text);
   Serial.println("or type custom text (matched against known prompts)");
-  Serial.println("OTA commands: 'ota <size>' to upload, 'push' to broadcast");
+  Serial.println("OTA commands: 'ota <size>' to upload, 'manifest <size>', 'push' to broadcast");
 }
 
 void loop() {
@@ -124,6 +177,12 @@ void loop() {
     uint32_t size = (uint32_t)line.substring(4).toInt();
     if (size > 0) ota_push_upload(size);
     else Serial.println("usage: ota <size_bytes>");
+    return;
+  }
+  if (line.startsWith("manifest ")) {
+    uint32_t size = (uint32_t)line.substring(9).toInt();
+    if (size > 0) ota_push_upload_manifest(size);
+    else Serial.println("usage: manifest <size_bytes>");
     return;
   }
   if (line == "push") {

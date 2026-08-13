@@ -46,6 +46,9 @@
 #if USE_PEER_PROTOCOL
 #include "peer_protocol.h"
 #endif
+#if USE_OTA && USE_CRYPTO
+#include "ota_verify.h"
+#endif
 #if USE_OTA
 #include "ota_espnow.h"
 #endif
@@ -299,7 +302,7 @@ void setup() {
                                      ESP_PARTITION_MMAP_DATA, &base, &h);
   if (err != ESP_OK) { Serial.printf("mmap failed: %d\n", err); return; }
 
-  if (llm_load((const uint8_t *)base, &model)) { Serial.println("bad model magic"); return; }
+  if (llm_load((const uint8_t *)base, part->size, &model)) { Serial.println("bad model"); return; }
   Cfg *c = &model.c;
   Serial.printf("model: V=%d D=%d L=%d H=%d F=%d P=%d  (mapped %.1f MB)\n",
                 c->vocab, c->dim, c->n_layers, c->n_heads, c->ffn, c->ple_dim,
@@ -385,6 +388,9 @@ void setup() {
     uint32_t _did = 0; for (int i=0;i<6;i++) { _did ^= _mac[i]; _did = (_did>>1)^(0xEDB88320&-(_did&1)); }
     sd_setup(_did, "p4-device", 0);
   }
+#endif
+#if USE_OTA && USE_CRYPTO
+  ota_verify_init();
 #endif
 #if USE_OTA
   ota_init();

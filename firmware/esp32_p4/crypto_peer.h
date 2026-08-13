@@ -1,37 +1,30 @@
-// Cryptographic hardening for the peer protocol.
+// Cryptographic hardening for ESP-NOW frames.
 //
-// Adds HMAC-SHA256 authentication and replay protection to peer frames.
-// Uses mbedtls (bundled with ESP-IDF) for cryptographic primitives.
+// Adds HMAC-SHA256 authentication and replay protection to all frames.
+// Uses the shared crypto_envelope.h for signing/verification and adds
+// per-sender replay tracking with session epochs.
 //
 // Design:
-//   - Shared pre-shared key (PSK) compiled into firmware. All devices in
-//     the same "flock" share the same key. Different flocks can't validate
-//     each other — this is intentional (club membership).
-//   - Each frame gets an HMAC-SHA256 tag (truncated to 8 bytes) appended.
-//   - A 4-byte timestamp (seconds since boot, wrapping) is included in
-//     the HMAC input for replay protection. Peers reject frames with
-//     timestamps more than 30 seconds from their own clock.
-//   - ECDH key exchange is deferred to a future revision — the PSK model
-//     fits the "same firmware = same flock" design.
+//   - Shared pre-shared key (PSK) for flock membership. Override at
+//     compile time or at runtime via SD card.
+//   - Each sender generates a random boot epoch (EA-06). The receiver
+//     tracks (sender_id, epoch, seq) — a new epoch starts a new replay
+//     window without time-based resets.
+//   - 16-byte envelope: [epoch:u32][seq:u32][hmac_tag:8]
 //
-// Frame format with crypto envelope:
+// Frame format:
 //   Original:  [type][payload...]
-//   Signed:    [type][payload...][timestamp:u32][hmac_tag:8]
-//
-// The tag covers: type + payload + timestamp. Receivers strip the 12-byte
-// trailer after verification.
+//   Signed:    [type][payload...][epoch:u32][seq:u32][hmac_tag:8]
 
 #ifndef CRYPTO_PEER_H
 #define CRYPTO_PEER_H
 
-#include "mbedtls/md.h"
-#include <string.h>
+#include "../common/crypto_envelope.h"
 #include <esp_timer.h>
+#include <esp_random.h>
 
-#define CRYPTO_TAG_LEN    8
-#define CRYPTO_TS_LEN     4
-#define CRYPTO_OVERHEAD   (CRYPTO_TAG_LEN + CRYPTO_TS_LEN)
-#define CRYPTO_MAX_DRIFT  30
+#define CRYPTO_TAG_LEN    CRYPTO_ENV_TAG_LEN
+#define CRYPTO_OVERHEAD   CRYPTO_ENV_OVERHEAD
 
 // Pre-shared key — all devices in the flock share this.
 // Override at compile time with -DCRYPTO_PSK="..." for different flocks.
@@ -51,94 +44,74 @@ static void crypto_set_psk(const char *psk) {
   _crypto_psk = _crypto_psk_buf;
 }
 
-// Monotonic TX sequence counter (V-05: replaces boot-relative timestamps).
+// Boot epoch — random per session, included in HMAC (EA-06).
+static uint32_t _crypto_epoch = 0;
+
+// Monotonic TX sequence counter.
 static uint32_t _crypto_tx_seq = 0;
 
-// Per-sender replay tracking (V-05: no clock sync needed).
+// Per-sender replay tracking with epoch (EA-06).
 #define CRYPTO_REPLAY_SLOTS 16
 static struct {
   uint32_t sender_id;
+  uint32_t epoch;
   uint32_t last_seq;
   int64_t last_seen_us;
   bool active;
 } _crypto_replay[CRYPTO_REPLAY_SLOTS];
 
-static void _crypto_hmac(const uint8_t *data, int len,
-                           uint32_t ts, uint8_t *tag_out) {
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-  mbedtls_md_setup(&ctx, info, 1);
-  mbedtls_md_hmac_starts(&ctx, (const unsigned char *)_crypto_psk,
-                          strlen(_crypto_psk));
-  mbedtls_md_hmac_update(&ctx, data, len);
-  mbedtls_md_hmac_update(&ctx, (const unsigned char *)&ts, 4);
-  uint8_t full[32];
-  mbedtls_md_hmac_finish(&ctx, full);
-  mbedtls_md_free(&ctx);
-  memcpy(tag_out, full, CRYPTO_TAG_LEN);
-}
-
 static void crypto_init() {
   memset(_crypto_replay, 0, sizeof(_crypto_replay));
   _crypto_tx_seq = 0;
+  _crypto_epoch = esp_random();
   _crypto_ready = true;
-  Serial.printf("[crypto] HMAC-SHA256 enabled (tag=%d, replay_slots=%d)\n",
-                CRYPTO_TAG_LEN, CRYPTO_REPLAY_SLOTS);
+  Serial.printf("[crypto] HMAC-SHA256 enabled (overhead=%d, epoch=0x%08X, replay_slots=%d)\n",
+                CRYPTO_OVERHEAD, _crypto_epoch, CRYPTO_REPLAY_SLOTS);
 }
 
 // Sign a frame in-place. The caller must have room for CRYPTO_OVERHEAD
 // extra bytes after the payload. Returns the new total length.
 static int crypto_sign(uint8_t *frame, int len) {
-  if (!_crypto_ready || len < 1 || len > 238) return len;
+  if (!_crypto_ready || len < 1 || len > 234) return len;
   uint32_t seq = _crypto_tx_seq++;
-  memcpy(frame + len, &seq, CRYPTO_TS_LEN);
-  _crypto_hmac(frame, len, seq, frame + len + CRYPTO_TS_LEN);
-  return len + CRYPTO_OVERHEAD;
+  return crypto_env_sign(_crypto_psk, frame, len, _crypto_epoch, seq);
 }
 
 // Verify and strip the crypto envelope. Returns the inner payload length
 // (>0) on success, 0 on failure (bad tag or replay).
 static int crypto_verify(const uint8_t *frame, int len) {
   if (!_crypto_ready) return len;
-  if (len < (int)CRYPTO_OVERHEAD + 1) return 0;
 
-  int payload_len = len - CRYPTO_OVERHEAD;
-  uint32_t seq;
-  memcpy(&seq, frame + payload_len, CRYPTO_TS_LEN);
+  uint32_t epoch, seq;
+  int payload_len = crypto_env_verify(_crypto_psk, frame, len, &epoch, &seq);
+  if (payload_len <= 0) return 0;
 
-  // Verify HMAC tag first (constant-time comparison).
-  uint8_t expected[CRYPTO_TAG_LEN];
-  _crypto_hmac(frame, payload_len, seq, expected);
-  const uint8_t *received = frame + payload_len + CRYPTO_TS_LEN;
-  uint8_t result = 0;
-  for (int i = 0; i < CRYPTO_TAG_LEN; i++)
-    result |= expected[i] ^ received[i];
-  if (result != 0) return 0;
-
-  // Per-sender replay check (V-05): extract sender_id from the payload
-  // (extension frames always carry device_id at bytes 1-4).
+  // Per-sender replay check: extract sender_id from the payload
+  // (extension frames carry device_id at bytes 1-4; prompt/token frames
+  // don't, but still benefit from epoch+seq monotonicity).
   if (payload_len >= 5) {
     uint32_t sender_id;
     memcpy(&sender_id, frame + 1, 4);
-    int64_t now_us = esp_timer_get_time();
 
     int slot = -1, evict = 0;
-    uint32_t evict_seq = UINT32_MAX;
+    int64_t oldest_us = INT64_MAX;
     for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
       if (_crypto_replay[i].active && _crypto_replay[i].sender_id == sender_id) {
         slot = i; break;
       }
-      if (!_crypto_replay[i].active) { evict = i; evict_seq = 0; }
-      else if (_crypto_replay[i].last_seq < evict_seq) {
-        evict_seq = _crypto_replay[i].last_seq; evict = i;
+      if (!_crypto_replay[i].active) { evict = i; oldest_us = 0; }
+      else if (_crypto_replay[i].last_seen_us < oldest_us) {
+        oldest_us = _crypto_replay[i].last_seen_us; evict = i;
       }
     }
 
+    int64_t now_us = esp_timer_get_time();
+
     if (slot >= 0) {
-      // Allow counter reset after 60s silence (handles sender reboot).
-      int64_t gap = now_us - _crypto_replay[slot].last_seen_us;
-      if (gap > 60000000LL) {
+      // EA-06: epoch-based session tracking replaces time-based reset.
+      if (epoch != _crypto_replay[slot].epoch) {
+        // New epoch = sender rebooted. Accept as new session.
+        _crypto_replay[slot].epoch = epoch;
         _crypto_replay[slot].last_seq = seq;
       } else if (seq <= _crypto_replay[slot].last_seq) {
         return 0;
@@ -148,6 +121,7 @@ static int crypto_verify(const uint8_t *frame, int len) {
       _crypto_replay[slot].last_seen_us = now_us;
     } else {
       _crypto_replay[evict].sender_id = sender_id;
+      _crypto_replay[evict].epoch = epoch;
       _crypto_replay[evict].last_seq = seq;
       _crypto_replay[evict].last_seen_us = now_us;
       _crypto_replay[evict].active = true;

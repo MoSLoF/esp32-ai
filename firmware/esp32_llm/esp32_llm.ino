@@ -137,7 +137,7 @@ void setup() {
                                      ESP_PARTITION_MMAP_DATA, &base, &h);
   if (err != ESP_OK) { Serial.printf("mmap failed: %d\n", err); return; }
 
-  if (llm_load((const uint8_t *)base, &model)) { Serial.println("bad model magic"); return; }
+  if (llm_load((const uint8_t *)base, part->size, &model)) { Serial.println("bad model"); return; }
   Cfg *c = &model.c;
   Serial.printf("model: V=%d D=%d L=%d H=%d F=%d P=%d  (mapped %.1f MB)\n",
                 c->vocab, c->dim, c->n_layers, c->n_heads, c->ffn, c->ple_dim,
