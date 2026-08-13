@@ -31,6 +31,7 @@
 #define USE_ESPNOW 0
 #define USE_PEER_PROTOCOL 0
 #define USE_OTA 0
+#define USE_SD 0
 #if (USE_PEER_PROTOCOL || USE_OTA) && !USE_ESPNOW
 #undef USE_ESPNOW
 #define USE_ESPNOW 1
@@ -43,6 +44,9 @@
 #endif
 #if USE_OTA
 #include "ota_espnow.h"
+#endif
+#if USE_SD
+#include "sd_config.h"
 #endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
@@ -161,6 +165,10 @@ void setup() {
   delay(1500);
   Serial.println("\n=== ESP32-P4 PLE TinyLM ===");
 
+#if USE_SD
+  sd_begin();
+#endif
+
   // Map the model partition.
   const esp_partition_t *part = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "model");
@@ -276,13 +284,17 @@ void setup() {
 #if USE_PEER_PROTOCOL
   peer_init(peer_infer);
 #endif
+#if USE_SD && USE_PEER_PROTOCOL
+  sd_load_config();
+  sd_load_name(_pr.name, PEER_NAME_LEN);
+#endif
 #if USE_OTA
   ota_init();
 #endif
 }
 
 void loop() {
-#if USE_PEER_PROTOCOL || USE_OTA
+#if USE_PEER_PROTOCOL || USE_OTA || USE_SD
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -293,6 +305,17 @@ void loop() {
       int idx = cmd.substring(9).toInt();
       persona_select(idx);
       persona_boot();
+    }
+#endif
+#if USE_SD
+    if (cmd == "ls") sd_list_dir(SD_MOUNT_POINT);
+    else if (cmd == "log") sd_dump_log();
+    else if (cmd.startsWith("cat ")) {
+      char buf[1024];
+      String path = String(SD_MOUNT_POINT "/") + cmd.substring(4);
+      int n = sd_read_file(path.c_str(), buf, sizeof(buf));
+      if (n > 0) Serial.println(buf);
+      else Serial.println("[sd] file not found or empty");
     }
 #endif
   }

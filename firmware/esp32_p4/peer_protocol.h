@@ -363,6 +363,9 @@ static void peer_tick() {
         Serial.printf("[!] discovered: %s (0x%08X)\n",
                       p->name, p->device_id);
         Serial.printf("    %s\n", persona()->quip_discover);
+#if USE_SD
+        sd_log_encounter(_pr.name, p->name, p->device_id, "DISCOVERED");
+#endif
       }
     }
     if (p) p->last_seen = now;
@@ -438,6 +441,9 @@ static void peer_tick() {
                         persona()->quip_bonded);
           Serial.printf("[**] BONDED with %s! (bond #%d)\n",
                         p->name, _pr.total_bonds);
+#if USE_SD
+          sd_log_bond(_pr.name, p->name, p->device_id, _pr.total_bonds);
+#endif
         }
       } else {
         Serial.printf("  %s  %s\n", persona()->face_rejected,
@@ -464,6 +470,9 @@ static void peer_tick() {
                       persona()->quip_bonded);
         Serial.printf("[**] BONDED with %s! (bond #%d)\n",
                       p->name, _pr.total_bonds);
+#if USE_SD
+        sd_log_bond(_pr.name, p->name, p->device_id, _pr.total_bonds);
+#endif
       }
     } else if (p) {
       Serial.printf("  %s  %s\n", persona()->face_rejected,
