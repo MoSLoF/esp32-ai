@@ -365,6 +365,7 @@ static void peer_tick() {
         Serial.printf("    %s\n", persona()->quip_discover);
 #if USE_SD
         sd_log_encounter(_pr.name, p->name, p->device_id, "DISCOVERED");
+        sd_record_peer(p->name, p->device_id);
 #endif
       }
     }

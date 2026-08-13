@@ -1,27 +1,38 @@
-ESP32-P4 SD Card Layout
-=======================
+ESP32-P4 SD Card — Auto-Provisioned
+====================================
 
-Copy these files to the root of a FAT32-formatted SD card.
-All files are optional -- missing files use compiled-in defaults.
+You do NOT need to create these files manually.
 
-Files:
-  identity.txt       Single digit 0-7 selecting a persona:
-                       0=GLITCH  1=SPECTRA  2=BYTE    3=WRAITH
-                       4=AXIOM   5=JINX     6=KERN    7=NEON
+Insert a blank FAT32-formatted SD card and power on the P4. The
+firmware detects the missing .p4cfg marker and writes all config
+files from compiled-in defaults. The card is ready immediately.
 
-  persona/name.txt   Custom device name (max 15 chars, e.g. "ghost-rider")
+To re-provision (reset to defaults), type "provision" in the serial
+monitor, or delete .p4cfg and reboot.
 
-  prompts.txt        Text prompts for inference, one per line.
-                     These are available for interactive generation.
+After provisioning, the card contains:
 
-  challenges.txt     Challenge token ID sequences for peer validation.
-                     One challenge per line, comma-separated token IDs.
-                     Extends the built-in challenge bank.
+  .p4cfg                  Marker file (version, device ID, persona)
+  config/
+    identity.txt          Persona index (0-7)
+    name.txt              Device name (e.g. "bold-spark")
+    prompts.txt           Inference prompts, one per line
+    challenges.txt        Challenge token IDs, CSV per line
+    peers.txt             Known peers (auto-updated on discovery)
+  log/
+    encounters.log        All peer events (discovery, validation, etc.)
+    bonds.log             Bond events only
+    stats.txt             Lifetime stats snapshot
 
-  encounters.log     Auto-generated encounter/bond log (don't edit).
-                     Format: millis,our_name,peer_name,peer_id,event
+You can edit config/ files on a PC — the firmware reads them back
+on the next boot. The format is always valid because the firmware
+wrote the original files.
 
-Serial commands (when USE_SD=1):
-  ls                 List SD card contents
-  log                Print encounter log
-  cat <filename>     Print a file from the SD card
+Serial commands (USE_SD=1):
+  ls                      List SD card root
+  ls config               List config directory
+  ls log                  List log directory
+  log                     Print encounter + bond logs
+  stats                   Save current stats to SD
+  provision               Re-write all config files from defaults
+  cat <path>              Print a file (e.g. "cat config/name.txt")

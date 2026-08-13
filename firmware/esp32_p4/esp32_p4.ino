@@ -285,8 +285,14 @@ void setup() {
   peer_init(peer_infer);
 #endif
 #if USE_SD && USE_PEER_PROTOCOL
-  sd_load_config();
+  sd_setup(_pr.device_id, _pr.name, _persona_idx);
   sd_load_name(_pr.name, PEER_NAME_LEN);
+#elif USE_SD
+  {
+    uint8_t _mac[6]; esp_read_mac(_mac, ESP_MAC_WIFI_STA);
+    uint32_t _did = 0; for (int i=0;i<6;i++) { _did ^= _mac[i]; _did = (_did>>1)^(0xEDB88320&-(_did&1)); }
+    sd_setup(_did, "p4-device", 0);
+  }
 #endif
 #if USE_OTA
   ota_init();
@@ -309,7 +315,19 @@ void loop() {
 #endif
 #if USE_SD
     if (cmd == "ls") sd_list_dir(SD_MOUNT_POINT);
+    else if (cmd == "ls config") sd_list_dir(SD_CFG);
+    else if (cmd == "ls log") sd_list_dir(SD_LOG);
     else if (cmd == "log") sd_dump_log();
+#if USE_PEER_PROTOCOL
+    else if (cmd == "stats") {
+      sd_save_stats(_pr.name, _pr.device_id,
+                    _pr.total_encounters, _pr.total_bonds);
+      Serial.println("[sd] stats saved");
+    }
+    else if (cmd == "provision") {
+      sd_provision(_pr.device_id, _pr.name, _persona_idx);
+    }
+#endif
     else if (cmd.startsWith("cat ")) {
       char buf[1024];
       String path = String(SD_MOUNT_POINT "/") + cmd.substring(4);
