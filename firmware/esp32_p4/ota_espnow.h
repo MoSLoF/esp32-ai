@@ -355,10 +355,13 @@ static void ota_tick() {
                 _ota.state = OTA_IDLE;
               } else {
                 // FR-08/R2-06: commit counter AFTER all finalization succeeds.
-                // Abort if counter persistence fails — rebooting with an
-                // uncommitted counter would allow rollback replay.
+                // R3-04: if counter commit fails, restore boot partition to
+                // the running partition to prevent booting un-countered firmware.
                 if (!ota_verify_commit_counter()) {
-                  Serial.println("[ota] counter commit failed, aborting update");
+                  Serial.println("[ota] counter commit failed, restoring boot partition");
+                  const esp_partition_t *running = esp_ota_get_running_partition();
+                  if (running)
+                    esp_ota_set_boot_partition(running);
                   _ota_tx_status(OTA_STATUS_ERROR);
                   _ota.state = OTA_IDLE;
                   ota_verify_reset();

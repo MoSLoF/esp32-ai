@@ -42,10 +42,12 @@ static const uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // Per-MAC rate limiting (EA-07): separate pre-auth and post-auth budgets.
 // FR-06: reserved authenticated budget prevents unauthenticated traffic
 // from starving verified peers.
+// R3-03: overflow verification budget bounds HMAC attempts from unknown MACs.
 #define ESPNOW_RX_LIMIT           100
 #define ESPNOW_RX_MAC_SLOTS       8
 #define ESPNOW_RX_GLOBAL_CEIL     500
 #define ESPNOW_RX_AUTHED_RESERVE  100
+#define ESPNOW_RX_VERIFY_OVERFLOW 50
 
 static struct {
   uint8_t mac[6];
@@ -57,6 +59,9 @@ static uint32_t _espnow_rx_global = 0;
 static int64_t _espnow_rx_global_window = 0;
 static uint32_t _espnow_rx_authed_count = 0;
 static int64_t _espnow_rx_authed_window = 0;
+// R3-03: overflow verification budget — bounds HMAC attempts when pre-auth exhausted.
+static uint32_t _espnow_rx_verify_overflow_count = 0;
+static int64_t _espnow_rx_verify_overflow_window = 0;
 
 // FR-06: diagnostic counters.
 static uint32_t _espnow_diag_preauth_drop = 0;
@@ -91,12 +96,19 @@ typedef int (*espnow_verify_fn_t)(const uint8_t *src_mac,
 
 static espnow_sign_fn_t _espnow_sign_fn = NULL;
 static espnow_verify_fn_t _espnow_verify_fn = NULL;
+// R3-02: when set, RX callback drops all frames until verify fn is installed.
+static bool _espnow_crypto_required = false;
 
 static void espnow_set_crypto(espnow_sign_fn_t sign_fn,
                                 espnow_verify_fn_t verify_fn) {
   _espnow_sign_fn = sign_fn;
   _espnow_verify_fn = verify_fn;
+  _espnow_crypto_required = true;
   Serial.println("[espnow] crypto hooks registered");
+}
+
+static void espnow_require_crypto() {
+  _espnow_crypto_required = true;
 }
 
 // Mesh relay hook — set via espnow_set_relay() when USE_MESH is enabled (B5).
@@ -169,29 +181,46 @@ static bool _espnow_authed_budget(int64_t now_us) {
   return (++_espnow_rx_authed_count <= ESPNOW_RX_AUTHED_RESERVE);
 }
 
+// R3-03: overflow verification budget — bounds HMAC attempts from unverified traffic.
+static bool _espnow_verify_overflow_budget(int64_t now_us) {
+  if (now_us - _espnow_rx_verify_overflow_window > 1000000) {
+    _espnow_rx_verify_overflow_count = 0;
+    _espnow_rx_verify_overflow_window = now_us;
+  }
+  return (++_espnow_rx_verify_overflow_count <= ESPNOW_RX_VERIFY_OVERFLOW);
+}
+
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
 
+  // R3-02: fail closed — drop all frames if crypto is required but not yet installed.
+  if (_espnow_crypto_required && !_espnow_verify_fn)
+    return;
+
   // FR-06/R2-07 two-tier rate limiting:
   // 1. Pre-auth global ceiling applies to ALL traffic.
-  // 2. If pre-auth budget is exhausted, check if authenticated budget
-  //    has room BEFORE doing expensive HMAC verification.
+  // 2. R3-03: when pre-auth exhausted, check overflow verification budget
+  //    to bound HMAC attempts, then verify, then check authed reserve.
   int64_t now_us = esp_timer_get_time();
   bool preauth_ok = _espnow_mac_ratelimit(info->src_addr, now_us);
 
   // EA-08: when crypto is enabled, verify ALL frame types.
   int verified_len = len;
   if (_espnow_verify_fn) {
-    // R2-07: when pre-auth budget is exhausted, check if authenticated
-    // budget has room BEFORE doing the expensive HMAC computation.
-    if (!preauth_ok && !_espnow_authed_budget(now_us)) {
+    // R3-03: when pre-auth exhausted, use overflow budget to bound HMAC attempts.
+    if (!preauth_ok && !_espnow_verify_overflow_budget(now_us)) {
       _espnow_diag_preauth_drop++;
       return;
     }
     verified_len = _espnow_verify_fn(info->src_addr, data, len);
     if (verified_len <= 0) return;
+    // R3-03: only decrement authenticated reserve AFTER successful HMAC.
     if (!preauth_ok) {
+      if (!_espnow_authed_budget(now_us)) {
+        _espnow_diag_preauth_drop++;
+        return;
+      }
       _espnow_diag_authed_pass++;
     }
   } else {

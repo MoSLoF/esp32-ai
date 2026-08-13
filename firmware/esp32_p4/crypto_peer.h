@@ -126,22 +126,19 @@ static int crypto_verify(const uint8_t *src_mac,
       int64_t silence = now_us - _crypto_replay[slot].last_seen_us;
       if (silence < CRYPTO_EPOCH_SILENCE_US)
         return 0;
-      // Push current epoch into retired ring (FIFO, oldest dropped).
-      if (_crypto_replay[slot].retired_count < CRYPTO_RETIRED_EPOCHS) {
-        _crypto_replay[slot].retired[_crypto_replay[slot].retired_count++] =
-            _crypto_replay[slot].epoch;
-      } else {
-        memmove(_crypto_replay[slot].retired, _crypto_replay[slot].retired + 1,
-                (CRYPTO_RETIRED_EPOCHS - 1) * sizeof(uint32_t));
-        _crypto_replay[slot].retired[CRYPTO_RETIRED_EPOCHS - 1] =
-            _crypto_replay[slot].epoch;
-      }
+      // R3-01: fail closed — reject when retired ring is full.
+      if (_crypto_replay[slot].retired_count >= CRYPTO_RETIRED_EPOCHS)
+        return 0;
+      _crypto_replay[slot].retired[_crypto_replay[slot].retired_count++] =
+          _crypto_replay[slot].epoch;
       _crypto_replay[slot].epoch = epoch;
       _crypto_replay[slot].last_seq = seq;
     }
     _crypto_replay[slot].last_seen_us = now_us;
   } else {
-    // New MAC — evicted senders start fresh (no baseline advantage).
+    // R3-01: fail closed — reject unknown MACs when all slots are active.
+    if (_crypto_replay[evict].active)
+      return 0;
     memcpy(_crypto_replay[evict].mac, src_mac, 6);
     _crypto_replay[evict].epoch = epoch;
     _crypto_replay[evict].retired_count = 0;
