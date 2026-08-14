@@ -17,6 +17,8 @@
 #include <WiFi.h>
 #include <esp_mac.h>
 #include <esp_random.h>
+#include <nvs_flash.h>
+#include <nvs.h>
 #include "../esp32_llm/vocab.h"   // shared token->text table for decoding RX
 #include "../common/crypto_envelope.h"
 #include "ota_push.h"
@@ -38,6 +40,10 @@ static const uint8_t BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const char *_sender_psk = CRYPTO_PSK;
 static uint32_t _sender_epoch = 0;
 static uint32_t _sender_tx_seq = 0;
+// This device's own MAC, bound into the HMAC as additional authenticated
+// data (R5-02) so a captured valid frame can't be replayed under a
+// different claimed source MAC.
+static uint8_t _sender_own_mac[6];
 #endif
 
 // Hardcoded prompt token tables. In a full system you'd run a tokenizer
@@ -58,22 +64,40 @@ static const PromptEntry PROMPTS[] = {
 };
 static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 
-// FR-02/R2-02: sender-side replay table with silence period and retired epochs.
+// FR-02/R2-02: sender-side replay table with silence period.
 #define SENDER_REPLAY_SLOTS 4
 #define SENDER_EPOCH_SILENCE_MS 5000
-#define SENDER_RETIRED_EPOCHS 4
-// R4-05: recovery thresholds for authenticated peers.
-#define SENDER_RECOVERY_SILENCE_MS 30000
+// R4-05: stale threshold for slot eviction (unrelated to epoch ordering).
 #define SENDER_SLOT_STALE_MS       60000
 static struct {
   uint8_t mac[6];
   uint32_t epoch;
-  uint32_t retired[SENDER_RETIRED_EPOCHS];
-  int retired_count;
   uint32_t last_seq;
   unsigned long last_seen_ms;
   bool active;
 } _sender_replay[SENDER_REPLAY_SLOTS];
+
+// R5-01: persistent monotonic epoch — mirrors crypto_peer.h's
+// crypto_next_persistent_epoch(). A random per-boot epoch has no ordering
+// relation across reboots, which is what forced the old design into a
+// bounded "retired epoch" ring that had to evict (and thus eventually
+// re-admit) entries to stay fail-closed. An NVS-persisted, monotonically
+// increasing counter makes a superseded epoch invalid forever.
+static uint32_t sender_next_persistent_epoch() {
+  nvs_handle_t h;
+  if (nvs_open("crypto_ep", NVS_READWRITE, &h) == ESP_OK) {
+    uint32_t epoch = 0;
+    nvs_get_u32(h, "boot_ctr", &epoch);
+    epoch++;
+    esp_err_t e1 = nvs_set_u32(h, "boot_ctr", epoch);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    if (e1 == ESP_OK && e2 == ESP_OK) return epoch;
+  }
+  Serial.println("[crypto] WARNING: persistent epoch counter unavailable — "
+                 "falling back to a random, non-monotonic epoch");
+  return esp_random();
+}
 
 // Peer protocol frame type for passive scanning.
 #define ESPNOW_MSG_IDENTITY 0x04
@@ -83,7 +107,7 @@ static void sender_send(const uint8_t *dest, uint8_t *frame, int len) {
 #if USE_CRYPTO
   if (len > 0) {
     uint32_t seq = _sender_tx_seq++;
-    len = crypto_env_sign(_sender_psk, frame, len, _sender_epoch, seq);
+    len = crypto_env_sign(_sender_psk, _sender_own_mac, frame, len, _sender_epoch, seq);
   }
 #endif
   esp_now_send(dest, frame, len);
@@ -100,7 +124,7 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 #if USE_CRYPTO
   {
     uint32_t ep, sq;
-    verified_len = crypto_env_verify(_sender_psk, data, len, &ep, &sq);
+    verified_len = crypto_env_verify(_sender_psk, info->src_addr, data, len, &ep, &sq);
     if (verified_len <= 0) return;
 
     // R2-02: replay check with silence period and retired epoch ring.
@@ -121,26 +145,17 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
       if (ep == _sender_replay[slot].epoch) {
         if (sq <= _sender_replay[slot].last_seq) return;
         _sender_replay[slot].last_seq = sq;
-      } else {
-        // Reject retired epochs.
-        for (int ri = 0; ri < _sender_replay[slot].retired_count; ri++) {
-          if (ep == _sender_replay[slot].retired[ri]) return;
-        }
-        // Require silence period before accepting new epoch.
+      } else if (ep > _sender_replay[slot].epoch) {
+        // New epoch — require silence period before accepting, as
+        // defense-in-depth against rapid epoch churn.
         if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_EPOCH_SILENCE_MS) return;
-        // R3-01: fail closed — reject when retired ring is full.
-        // R4-05: authenticated recovery — FIFO evict oldest retired epoch
-        // after extended silence.
-        if (_sender_replay[slot].retired_count >= SENDER_RETIRED_EPOCHS) {
-          if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_RECOVERY_SILENCE_MS) return;
-          for (int ri = 1; ri < _sender_replay[slot].retired_count; ri++)
-            _sender_replay[slot].retired[ri - 1] = _sender_replay[slot].retired[ri];
-          _sender_replay[slot].retired_count--;
-        }
-        _sender_replay[slot].retired[_sender_replay[slot].retired_count++] =
-            _sender_replay[slot].epoch;
         _sender_replay[slot].epoch = ep;
         _sender_replay[slot].last_seq = sq;
+      } else {
+        // R5-01: epoch is a persistent monotonic sender boot counter, so
+        // any epoch not strictly greater than the highest ever accepted
+        // is permanently retired — no eviction path can reopen it.
+        return;
       }
       _sender_replay[slot].last_seen_ms = now_ms;
     } else {
@@ -151,8 +166,6 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
       }
       memcpy(_sender_replay[evict].mac, info->src_addr, 6);
       _sender_replay[evict].epoch = ep;
-      _sender_replay[evict].retired_count = 0;
-      memset(_sender_replay[evict].retired, 0, sizeof(_sender_replay[evict].retired));
       _sender_replay[evict].last_seq = sq;
       _sender_replay[evict].last_seen_ms = now_ms;
       _sender_replay[evict].active = true;
@@ -203,6 +216,17 @@ void setup() {
   delay(1000);
   Serial.println("\n=== ESP-NOW Prompt Sender ===");
 
+  // R5-01: NVS must be ready before the persistent epoch counter can be
+  // loaded, so init it before anything else touches crypto state.
+  esp_err_t nvs_err = nvs_flash_init();
+  if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+      nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    nvs_err = nvs_flash_init();
+  }
+  if (nvs_err != ESP_OK)
+    Serial.printf("[nvs] init failed: %d\n", nvs_err);
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
@@ -214,8 +238,9 @@ void setup() {
   // R3-02: initialize crypto state BEFORE registering RX callback so
   // on_rx never processes frames without authentication.
 #if USE_CRYPTO
-  _sender_epoch = esp_random();
+  _sender_epoch = sender_next_persistent_epoch();
   _sender_tx_seq = 0;
+  esp_read_mac(_sender_own_mac, ESP_MAC_WIFI_STA);
   _otap_epoch_ptr = &_sender_epoch;
   _otap_tx_seq_ptr = &_sender_tx_seq;
   _otap_crypto_enabled = true;

@@ -14,6 +14,7 @@
 #include "esp_partition.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
 #include "pin_map.h"
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
@@ -339,6 +340,20 @@ void setup() {
   delay(1500);
   Serial.println("\n=== ESP32-P4 PLE TinyLM ===");
 
+  // R5-01: NVS must be ready before crypto_init() can load the persistent
+  // epoch counter, so init it unconditionally, first thing. Safe to call
+  // even when no feature below ends up touching NVS.
+  {
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      nvs_flash_erase();
+      nvs_err = nvs_flash_init();
+    }
+    if (nvs_err != ESP_OK)
+      Serial.printf("[nvs] init failed: %d\n", nvs_err);
+  }
+
 #if USE_COMPANION
   companion_begin();
 #endif
@@ -482,19 +497,7 @@ void setup() {
     sd_setup(_did, "p4-device", 0);
   }
 #endif
-// FR-04: ensure NVS is initialized even when peer_protocol is disabled.
-#if USE_OTA && !USE_PEER_PROTOCOL
-  {
-    esp_err_t nvs_err = nvs_flash_init();
-    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      nvs_flash_erase();
-      nvs_err = nvs_flash_init();
-    }
-    if (nvs_err != ESP_OK)
-      Serial.printf("[nvs] init failed: %d\n", nvs_err);
-  }
-#endif
+// R5-01: NVS is now initialized unconditionally at the top of setup().
 #if USE_OTA
   ota_verify_init();
   ota_init();
