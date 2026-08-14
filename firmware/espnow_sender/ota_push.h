@@ -257,6 +257,11 @@ static void ota_push_tick() {
       memcpy(_otap.receiver_mac, _otap_req_ring[rd].mac, 6);
       _otap.receiver_bound = true;
     }
+    // R3-05: reject requests from MACs other than the bound receiver.
+    if (memcmp(_otap_req_ring[rd].mac, _otap.receiver_mac, 6) != 0) {
+      __atomic_store_n(&_otap_req_rd, (rd + 1) % OTAP_RING, __ATOMIC_RELEASE);
+      continue;
+    }
     if (seq < _otap.n_chunks) {
       uint32_t offset = (uint32_t)seq * _otap.chunk_size;
       uint32_t remaining = _otap.fw_size - offset;

@@ -213,17 +213,32 @@ static void head_matvec_int8(const QT *t, const float *x, float *y) {
 // R2-07: aggregate PSRAM allocation cap prevents runaway allocations.
 #define PSRAM_ALLOC_CAP (24 * 1024 * 1024)  // 24 MB hard limit
 static size_t _ps_total = 0;
+// R3-06: setup_ok flag — guards inference calls after allocation failure.
+static bool _setup_ok = false;
 
 static void *ps(size_t n) {
   if (n > PSRAM_ALLOC_CAP || _ps_total + n > PSRAM_ALLOC_CAP) {
     Serial.printf("PSRAM cap exceeded (%u + %u > %u)\n",
                   (unsigned)_ps_total, (unsigned)n, (unsigned)PSRAM_ALLOC_CAP);
-    while (1) delay(1000);
+    return NULL;
   }
   void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
-  if (!p) { Serial.printf("PSRAM alloc failed (%u bytes)\n", (unsigned)n); while (1) delay(1000); }
+  if (!p) { Serial.printf("PSRAM alloc failed (%u bytes)\n", (unsigned)n); return NULL; }
   _ps_total += n;
   return p;
+}
+
+// R3-06: preflight check — verify KV cache sizes won't overflow 32-bit arithmetic.
+static bool _psram_preflight(Cfg *c) {
+  size_t kv_size;
+  size_t ls = (size_t)c->n_layers * (size_t)c->seq_len;
+  size_t lsd;
+  if (_llm_mul_overflow(ls, (size_t)c->dim, &lsd)) return false;
+  if (_llm_mul_overflow(lsd, 4, &kv_size)) return false;
+  if (kv_size > PSRAM_ALLOC_CAP) return false;
+  // Two KV caches + scratch must fit.
+  if (kv_size > PSRAM_ALLOC_CAP / 2) return false;
+  return true;
 }
 
 static void stage_head_int8(QT *t) {
@@ -263,6 +278,7 @@ static void _comp_cb_status() {
 }
 
 static void _comp_cb_generate(int n) {
+  if (!_setup_ok) return;
   run_generate(PROMPT_IDS, sizeof(PROMPT_IDS) / sizeof(int), n);
 }
 
@@ -346,10 +362,12 @@ void setup() {
 #endif
 #endif
 #if USE_ESPNOW
-  if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
+  // R3-02: install crypto hooks BEFORE espnow_begin so the RX callback
+  // never processes frames without authentication.
 #if USE_CRYPTO
   espnow_set_crypto(crypto_sign, crypto_verify);
 #endif
+  if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
 #endif
 
   // Cap head rows to the trained vocab BEFORE staging.
@@ -362,6 +380,12 @@ void setup() {
     return;
   }
   model.head_matvec = head_matvec_int8;
+
+  // R3-06: preflight overflow check before any allocation.
+  if (!_psram_preflight(c)) {
+    Serial.println("PSRAM preflight failed: model dimensions overflow 32-bit");
+    return;
+  }
 
   int D = c->dim, L = c->n_layers, P = c->ple_dim, F = c->ffn, V = c->vocab, S = c->seq_len;
   s.x = (float *)ps(D * 4);
@@ -377,25 +401,34 @@ void setup() {
   s.scores = (float *)ps(S * 4);
   s.kcache = (float *)ps((size_t)L * S * D * 4);
   s.vcache = (float *)ps((size_t)L * S * D * 4);
+  if (!s.x || !s.h || !s.qkv || !s.att || !s.g1 || !s.g2 ||
+      !s.ple || !s.tmpP || !s.trow || !s.logits || !s.scores ||
+      !s.kcache || !s.vcache) {
+    Serial.println("PSRAM allocation failed — inference disabled");
+    return;
+  }
   Serial.printf("PSRAM free after alloc: %u KB\n\n",
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
 
-  // ---- initial generation ----
-  int prompt_buf[128];
-  int n_prompt = sizeof(PROMPT_IDS) / sizeof(int);
-  const int *prompt_ids = PROMPT_IDS;
-#if USE_ESPNOW
-  Serial.println("waiting for ESP-NOW prompt (or using default in 5s)...");
-  for (int w = 0; w < 50 && !_espnow_prompt_ready; w++) delay(100);
-  int espnow_n = espnow_poll_prompt(prompt_buf, 128);
-  if (espnow_n > 0) {
-    prompt_ids = prompt_buf;
-    n_prompt = espnow_n;
-    Serial.printf("received %d-token prompt via ESP-NOW\n", n_prompt);
-  }
-#endif
+  _setup_ok = true;
 
-  run_generate(prompt_ids, n_prompt, N_GENERATE);
+  // ---- initial generation ----
+  if (_setup_ok) {
+    int prompt_buf[128];
+    int n_prompt = sizeof(PROMPT_IDS) / sizeof(int);
+    const int *prompt_ids = PROMPT_IDS;
+#if USE_ESPNOW
+    Serial.println("waiting for ESP-NOW prompt (or using default in 5s)...");
+    for (int w = 0; w < 50 && !_espnow_prompt_ready; w++) delay(100);
+    int espnow_n = espnow_poll_prompt(prompt_buf, 128);
+    if (espnow_n > 0) {
+      prompt_ids = prompt_buf;
+      n_prompt = espnow_n;
+      Serial.printf("received %d-token prompt via ESP-NOW\n", n_prompt);
+    }
+#endif
+    run_generate(prompt_ids, n_prompt, N_GENERATE);
+  }
 
 #if USE_PEER_PROTOCOL
   peer_init(peer_infer);
@@ -474,7 +507,10 @@ void setup() {
   companion_on_peers(_comp_cb_peers);
   companion_on_prompt([](const char *text) {
     Serial.printf("[companion] prompt: %s\n", text);
-    run_generate(PROMPT_IDS, sizeof(PROMPT_IDS) / sizeof(int), N_GENERATE);
+    if (_setup_ok)
+      run_generate(PROMPT_IDS, sizeof(PROMPT_IDS) / sizeof(int), N_GENERATE);
+    else
+      Serial.println("inference disabled (setup failed)");
   });
 #endif
 }
@@ -526,28 +562,27 @@ void loop() {
     // SD-loaded prompts: "generate" picks a random SD prompt, "generate N"
     // generates N tokens from the default prompt.
     if (cmd == "generate" || cmd.startsWith("generate ")) {
-      int n_tok = N_GENERATE;
-      const int *p_ids = PROMPT_IDS;
-      int p_n = sizeof(PROMPT_IDS) / sizeof(int);
+      if (!_setup_ok) { Serial.println("inference disabled (setup failed)"); }
+      else {
+        int n_tok = N_GENERATE;
+        const int *p_ids = PROMPT_IDS;
+        int p_n = sizeof(PROMPT_IDS) / sizeof(int);
 #if USE_SD
-      int sd_n = sd_prompt_count();
-      if (sd_n > 0 && cmd == "generate") {
-        int pick = (int)(millis() % sd_n);
-        const char *txt = sd_prompt(pick);
-        if (txt) {
-          Serial.printf("[sd] prompt %d: %s\n", pick, txt);
-          // Use the default prompt IDs but print what was selected.
-          // Full text tokenization would require the tokenizer on-chip;
-          // for now SD prompts serve as cue labels and the token IDs
-          // fall back to compiled-in PROMPT_IDS.
+        int sd_n = sd_prompt_count();
+        if (sd_n > 0 && cmd == "generate") {
+          int pick = (int)(millis() % sd_n);
+          const char *txt = sd_prompt(pick);
+          if (txt) {
+            Serial.printf("[sd] prompt %d: %s\n", pick, txt);
+          }
         }
-      }
 #endif
-      if (cmd.startsWith("generate ")) {
-        int v = cmd.substring(9).toInt();
-        if (v > 0 && v <= 2000) n_tok = v;
+        if (cmd.startsWith("generate ")) {
+          int v = cmd.substring(9).toInt();
+          if (v > 0 && v <= 2000) n_tok = v;
+        }
+        run_generate(p_ids, p_n, n_tok);
       }
-      run_generate(p_ids, p_n, n_tok);
     }
     else if (cmd == "help") {
       Serial.println("commands:");

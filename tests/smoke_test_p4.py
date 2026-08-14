@@ -1189,8 +1189,9 @@ def test_r2_02_retired_epoch_ring():
     assert "retired_count" in crypto, (
         "replay slot must track how many retired epochs are stored"
     )
-    assert "memmove" in crypto, (
-        "retired ring must shift entries when full (FIFO eviction)"
+    # R3-01: retired ring is now fail-closed (reject when full, no FIFO eviction).
+    assert "retired_count >= CRYPTO_RETIRED_EPOCHS" in crypto, (
+        "retired ring must reject when full (fail-closed)"
     )
 
 
@@ -1333,16 +1334,206 @@ def test_r2_07_psram_allocation_cap():
 
 
 def test_r2_07_ratelimit_before_hmac():
-    """R2-07: Rate-limit drop must happen before expensive HMAC verification."""
+    """R2-07/R3-03: Overflow verification budget must gate HMAC attempts."""
     en = read_file("espnow_comm.h")
     assert en is not None
     rx_fn = en[en.index("_espnow_rx("):]
     rx_fn = rx_fn[:rx_fn.index("\n}\n") + 3]
-    # The authed_budget check must come BEFORE _espnow_verify_fn call.
-    authed_check = rx_fn.index("_espnow_authed_budget")
+    # R3-03: overflow budget check must come BEFORE _espnow_verify_fn call.
+    overflow_check = rx_fn.index("_espnow_verify_overflow_budget")
     verify_call = rx_fn.index("_espnow_verify_fn(")
-    assert authed_check < verify_call, (
-        "authenticated budget check must happen before HMAC verification"
+    assert overflow_check < verify_call, (
+        "overflow verification budget must gate HMAC attempts"
+    )
+    # R3-03: authed reserve must come AFTER successful HMAC.
+    authed_check = rx_fn.index("_espnow_authed_budget")
+    assert verify_call < authed_check, (
+        "authenticated budget must be checked after HMAC verification"
+    )
+
+
+# ---- R3 (Remediation Reassessment Round 3) tests ---------------------------
+
+def test_r3_01_fail_closed_retired_ring():
+    """R3-01: Replay must reject when retired epoch ring is full."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "retired_count >= CRYPTO_RETIRED_EPOCHS" in crypto, (
+        "must reject (return 0) when retired ring is full"
+    )
+    assert "memmove" not in crypto, (
+        "must not use FIFO eviction on retired ring (fail-closed instead)"
+    )
+
+
+def test_r3_01_fail_closed_replay_slots():
+    """R3-01: Replay must reject unknown MACs when all slots are active."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    # Find the new-MAC branch (second "R3-01: fail closed" occurrence).
+    first_idx = crypto.index("R3-01: fail closed")
+    new_mac_idx = crypto.index("R3-01: fail closed", first_idx + 1)
+    new_mac_section = crypto[new_mac_idx:new_mac_idx + 200]
+    assert "_crypto_replay[evict].active" in new_mac_section, (
+        "must check evict slot is inactive before accepting new MAC"
+    )
+    assert "return 0" in new_mac_section, (
+        "must return 0 when all replay slots are active"
+    )
+
+
+def test_r3_01_sender_fail_closed():
+    """R3-01: Sender replay must also be fail-closed."""
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    assert "retired_count >= SENDER_RETIRED_EPOCHS" in sender, (
+        "sender must reject when retired ring is full"
+    )
+    assert "memmove" not in sender, (
+        "sender must not use FIFO eviction (fail-closed instead)"
+    )
+    assert "_sender_replay[evict].active" in sender, (
+        "sender must reject unknown MACs when all slots active"
+    )
+
+
+def test_r3_02_crypto_required_flag():
+    """R3-02: espnow_comm.h must have crypto_required fail-closed flag."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "_espnow_crypto_required" in en, (
+        "must have _espnow_crypto_required flag"
+    )
+    assert "espnow_require_crypto" in en, (
+        "must have espnow_require_crypto() function"
+    )
+    rx_fn = en[en.index("_espnow_rx("):]
+    rx_fn = rx_fn[:rx_fn.index("\n}\n") + 3]
+    assert "_espnow_crypto_required && !_espnow_verify_fn" in rx_fn, (
+        "RX callback must drop frames when crypto required but not installed"
+    )
+
+
+def test_r3_02_crypto_before_begin():
+    """R3-02: espnow_set_crypto must be called before espnow_begin."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    set_crypto_pos = ino.index("espnow_set_crypto(")
+    begin_pos = ino.index("espnow_begin()")
+    assert set_crypto_pos < begin_pos, (
+        "espnow_set_crypto must be called before espnow_begin"
+    )
+
+
+def test_r3_02_sender_crypto_before_rx():
+    """R3-02: Sender must init crypto before registering RX callback."""
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    crypto_pos = sender.index("_sender_epoch = esp_random()")
+    rx_cb_pos = sender.index("esp_now_register_recv_cb(on_rx)")
+    assert crypto_pos < rx_cb_pos, (
+        "sender crypto init must happen before esp_now_register_recv_cb"
+    )
+
+
+def test_r3_03_overflow_verification_budget():
+    """R3-03: Must have overflow verification budget to bound HMAC attempts."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "ESPNOW_RX_VERIFY_OVERFLOW" in en, (
+        "must define ESPNOW_RX_VERIFY_OVERFLOW budget"
+    )
+    assert "_espnow_verify_overflow_budget" in en, (
+        "must have overflow verification budget function"
+    )
+    rx_fn = en[en.index("_espnow_rx("):]
+    rx_fn = rx_fn[:rx_fn.index("\n}\n") + 3]
+    assert "_espnow_verify_overflow_budget" in rx_fn, (
+        "RX callback must use overflow budget when pre-auth exhausted"
+    )
+
+
+def test_r3_03_authed_budget_after_hmac():
+    """R3-03: Authenticated reserve must be checked AFTER successful HMAC."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    rx_fn = en[en.index("_espnow_rx("):]
+    rx_fn = rx_fn[:rx_fn.index("\n}\n") + 3]
+    verify_pos = rx_fn.index("_espnow_verify_fn(info->src_addr")
+    authed_pos = rx_fn.index("_espnow_authed_budget(now_us)")
+    assert verify_pos < authed_pos, (
+        "authed budget check must come AFTER HMAC verification"
+    )
+
+
+def test_r3_04_boot_partition_rollback():
+    """R3-04: Counter commit failure must restore boot partition."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    commit_idx = ota.index("ota_verify_commit_counter()")
+    commit_section = ota[commit_idx:commit_idx + 400]
+    assert "esp_ota_get_running_partition" in commit_section, (
+        "counter commit failure must call esp_ota_get_running_partition"
+    )
+    assert "esp_ota_set_boot_partition(running)" in commit_section, (
+        "counter commit failure must restore boot partition to running"
+    )
+
+
+def test_r3_05_sender_request_mac_filter():
+    """R3-05: Sender must filter OTA requests by bound receiver MAC."""
+    push = (SENDER_DIR / "ota_push.h").read_text()
+    req_drain = push[push.index("Drain request ring"):]
+    req_section = req_drain[:req_drain.index("drain status ring")]
+    assert "memcmp(_otap_req_ring[rd].mac, _otap.receiver_mac, 6)" in req_section, (
+        "request drain must compare request MAC against bound receiver"
+    )
+
+
+def test_r3_06_ps_returns_null():
+    """R3-06: ps() must return NULL on failure, not enter infinite loop."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    ps_fn = ino[ino.index("static void *ps("):]
+    ps_fn = ps_fn[:ps_fn.index("\n}\n") + 3]
+    assert "while (1)" not in ps_fn, (
+        "ps() must not hang in infinite loop on failure"
+    )
+    assert "return NULL" in ps_fn, (
+        "ps() must return NULL on failure"
+    )
+
+
+def test_r3_06_psram_preflight():
+    """R3-06: Setup must do overflow-checked preflight before allocation."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "_psram_preflight" in ino, (
+        "must have _psram_preflight function"
+    )
+    assert "_llm_mul_overflow" in ino, (
+        "preflight must use overflow-checked multiplication"
+    )
+    preflight_pos = ino.index("_psram_preflight(c)")
+    first_ps_pos = ino.index("ps(D * 4)")
+    assert preflight_pos < first_ps_pos, (
+        "preflight check must happen before first ps() allocation"
+    )
+
+
+def test_r3_06_setup_ok_flag():
+    """R3-06: inference must be guarded by _setup_ok flag."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "_setup_ok" in ino, (
+        "must have _setup_ok flag"
+    )
+    assert "_setup_ok = true" in ino, (
+        "must set _setup_ok after successful allocation"
+    )
+    # Verify run_generate calls are guarded.
+    generate_cmd = ino[ino.index('cmd == "generate"'):]
+    generate_section = generate_cmd[:generate_cmd.index("help")]
+    assert "_setup_ok" in generate_section, (
+        "generate command must check _setup_ok before calling run_generate"
     )
 
 

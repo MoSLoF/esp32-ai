@@ -125,21 +125,17 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
         }
         // Require silence period before accepting new epoch.
         if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_EPOCH_SILENCE_MS) return;
-        // Push current epoch into retired ring.
-        if (_sender_replay[slot].retired_count < SENDER_RETIRED_EPOCHS) {
-          _sender_replay[slot].retired[_sender_replay[slot].retired_count++] =
-              _sender_replay[slot].epoch;
-        } else {
-          memmove(_sender_replay[slot].retired, _sender_replay[slot].retired + 1,
-                  (SENDER_RETIRED_EPOCHS - 1) * sizeof(uint32_t));
-          _sender_replay[slot].retired[SENDER_RETIRED_EPOCHS - 1] =
-              _sender_replay[slot].epoch;
-        }
+        // R3-01: fail closed — reject when retired ring is full.
+        if (_sender_replay[slot].retired_count >= SENDER_RETIRED_EPOCHS) return;
+        _sender_replay[slot].retired[_sender_replay[slot].retired_count++] =
+            _sender_replay[slot].epoch;
         _sender_replay[slot].epoch = ep;
         _sender_replay[slot].last_seq = sq;
       }
       _sender_replay[slot].last_seen_ms = now_ms;
     } else {
+      // R3-01: fail closed — reject unknown MACs when all slots active.
+      if (_sender_replay[evict].active) return;
       memcpy(_sender_replay[evict].mac, info->src_addr, 6);
       _sender_replay[evict].epoch = ep;
       _sender_replay[evict].retired_count = 0;
@@ -201,6 +197,19 @@ void setup() {
     Serial.println("ESP-NOW init failed");
     return;
   }
+
+  // R3-02: initialize crypto state BEFORE registering RX callback so
+  // on_rx never processes frames without authentication.
+#if USE_CRYPTO
+  _sender_epoch = esp_random();
+  _sender_tx_seq = 0;
+  _otap_epoch_ptr = &_sender_epoch;
+  _otap_tx_seq_ptr = &_sender_tx_seq;
+  _otap_crypto_enabled = true;
+  Serial.printf("[crypto] HMAC-SHA256 enabled (epoch=0x%08X)\n",
+                _sender_epoch);
+#endif
+
   esp_now_register_recv_cb(on_rx);
 
   esp_now_peer_info_t peer = {};
@@ -211,18 +220,6 @@ void setup() {
 
   ota_push_init();
   memset(_sender_replay, 0, sizeof(_sender_replay));
-
-#if USE_CRYPTO
-  _sender_epoch = esp_random();
-  _sender_tx_seq = 0;
-  // R2-03: share epoch and tx_seq with OTA path so both use a single
-  // monotonic counter per MAC+epoch pair.
-  _otap_epoch_ptr = &_sender_epoch;
-  _otap_tx_seq_ptr = &_sender_tx_seq;
-  _otap_crypto_enabled = true;
-  Serial.printf("[crypto] HMAC-SHA256 enabled (epoch=0x%08X)\n",
-                _sender_epoch);
-#endif
 
   Serial.println("ready. type a prompt (or number 1-4):");
   for (int i = 0; i < N_PROMPTS; i++)
