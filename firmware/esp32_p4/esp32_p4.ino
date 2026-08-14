@@ -228,8 +228,25 @@ static void *ps(size_t n) {
   return p;
 }
 
-// R3-06: preflight check — verify KV cache sizes won't overflow 32-bit arithmetic.
+// R3-06/R4-01: preflight check — verify model dimension invariants and
+// allocation budgets before any PSRAM staging.
 static bool _psram_preflight(Cfg *c) {
+  // R4-01: validate V >= VOCAB_N so logits iteration stays in bounds.
+  if (c->vocab < VOCAB_N) {
+    Serial.printf("preflight: V=%d < VOCAB_N=%d\n", c->vocab, VOCAB_N);
+    return false;
+  }
+  // R4-01: validate D fits the fixed-size head_actq[128] buffer.
+  if (c->dim > 128) {
+    Serial.printf("preflight: D=%d > head_actq capacity 128\n", c->dim);
+    return false;
+  }
+  // R4-01: head staging budget — weights + scales must fit in PSRAM cap.
+  size_t head_w_size, head_s_size;
+  if (_llm_mul_overflow((size_t)VOCAB_N, (size_t)c->dim, &head_w_size)) return false;
+  if (_llm_mul_overflow((size_t)VOCAB_N, sizeof(float), &head_s_size)) return false;
+  if (head_w_size + head_s_size > PSRAM_ALLOC_CAP) return false;
+  // KV cache overflow check.
   size_t kv_size;
   size_t ls = (size_t)c->n_layers * (size_t)c->seq_len;
   size_t lsd;
@@ -241,10 +258,16 @@ static bool _psram_preflight(Cfg *c) {
   return true;
 }
 
-static void stage_head_int8(QT *t) {
+// R4-01: returns false on allocation failure so caller can abort.
+static bool stage_head_int8(QT *t) {
   head_rows = t->rows; head_cols = t->cols;
   head_w8 = (int8_t *)ps((size_t)head_rows * head_cols);
   head_scale8 = (float *)ps((size_t)head_rows * sizeof(float));
+  // R4-01: NULL-check ps() results before dereferencing.
+  if (!head_w8 || !head_scale8) {
+    Serial.println("head staging failed: PSRAM allocation returned NULL");
+    return false;
+  }
   for (int r = 0; r < head_rows; r++) {
     const uint8_t *row = t->codes + (size_t)r * t->row_bytes;
     int8_t *dst = head_w8 + (size_t)r * head_cols;
@@ -257,6 +280,7 @@ static void stage_head_int8(QT *t) {
   }
   Serial.printf("head staged int8: %.2f MB\n",
                 ((size_t)head_rows * head_cols + (size_t)head_rows * 4) / 1e6);
+  return true;
 }
 
 // ---- companion app callbacks -----------------------------------------------
@@ -370,9 +394,20 @@ void setup() {
   if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
 #endif
 
+  // R4-01: preflight BEFORE any PSRAM staging to validate V/D invariants
+  // and allocation budgets.
+  if (!_psram_preflight(c)) {
+    Serial.println("PSRAM preflight failed: model dimensions overflow or invariant violation");
+    return;
+  }
+
   // Cap head rows to the trained vocab BEFORE staging.
   model.tok_emb.rows = VOCAB_N;
-  stage_head_int8(&model.tok_emb);
+  // R4-01: stage_head_int8 returns false on allocation failure.
+  if (!stage_head_int8(&model.tok_emb)) {
+    Serial.println("head staging failed — inference disabled");
+    return;
+  }
   inference_task = xTaskGetCurrentTaskHandle();
   if (xTaskCreatePinnedToCore(head_worker_main, "head", 8192, NULL, 2,
                              &head_worker, 0) != pdPASS) {
@@ -380,12 +415,6 @@ void setup() {
     return;
   }
   model.head_matvec = head_matvec_int8;
-
-  // R3-06: preflight overflow check before any allocation.
-  if (!_psram_preflight(c)) {
-    Serial.println("PSRAM preflight failed: model dimensions overflow 32-bit");
-    return;
-  }
 
   int D = c->dim, L = c->n_layers, P = c->ple_dim, F = c->ffn, V = c->vocab, S = c->seq_len;
   s.x = (float *)ps(D * 4);

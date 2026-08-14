@@ -1355,41 +1355,47 @@ def test_r2_07_ratelimit_before_hmac():
 # ---- R3 (Remediation Reassessment Round 3) tests ---------------------------
 
 def test_r3_01_fail_closed_retired_ring():
-    """R3-01: Replay must reject when retired epoch ring is full."""
+    """R3-01: Replay must reject when retired epoch ring is full (R4-05 adds recovery)."""
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
     assert "retired_count >= CRYPTO_RETIRED_EPOCHS" in crypto, (
-        "must reject (return 0) when retired ring is full"
+        "must check retired ring capacity"
     )
-    assert "memmove" not in crypto, (
-        "must not use FIFO eviction on retired ring (fail-closed instead)"
+    # R4-05: recovery is allowed after extended silence; default still rejects.
+    assert "CRYPTO_RECOVERY_SILENCE_US" in crypto, (
+        "must define recovery silence threshold for retired ring eviction"
     )
 
 
 def test_r3_01_fail_closed_replay_slots():
-    """R3-01: Replay must reject unknown MACs when all slots are active."""
+    """R3-01: Replay must reject unknown MACs when all slots are active (R4-05 adds stale eviction)."""
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
     # Find the new-MAC branch (second "R3-01: fail closed" occurrence).
     first_idx = crypto.index("R3-01: fail closed")
     new_mac_idx = crypto.index("R3-01: fail closed", first_idx + 1)
-    new_mac_section = crypto[new_mac_idx:new_mac_idx + 200]
+    new_mac_section = crypto[new_mac_idx:new_mac_idx + 400]
     assert "_crypto_replay[evict].active" in new_mac_section, (
         "must check evict slot is inactive before accepting new MAC"
     )
     assert "return 0" in new_mac_section, (
-        "must return 0 when all replay slots are active"
+        "must return 0 when all replay slots are active and not stale"
+    )
+    # R4-05: stale eviction must be gated by CRYPTO_SLOT_STALE_US.
+    assert "CRYPTO_SLOT_STALE_US" in new_mac_section, (
+        "stale eviction must use CRYPTO_SLOT_STALE_US threshold"
     )
 
 
 def test_r3_01_sender_fail_closed():
-    """R3-01: Sender replay must also be fail-closed."""
+    """R3-01: Sender replay must also be fail-closed (R4-05 adds recovery)."""
     sender = (SENDER_DIR / "espnow_sender.ino").read_text()
     assert "retired_count >= SENDER_RETIRED_EPOCHS" in sender, (
-        "sender must reject when retired ring is full"
+        "sender must check retired ring capacity"
     )
-    assert "memmove" not in sender, (
-        "sender must not use FIFO eviction (fail-closed instead)"
+    # R4-05: recovery is allowed after extended silence; default still rejects.
+    assert "SENDER_RECOVERY_SILENCE_MS" in sender, (
+        "sender must define recovery silence threshold"
     )
     assert "_sender_replay[evict].active" in sender, (
         "sender must reject unknown MACs when all slots active"
@@ -1534,6 +1540,247 @@ def test_r3_06_setup_ok_flag():
     generate_section = generate_cmd[:generate_cmd.index("help")]
     assert "_setup_ok" in generate_section, (
         "generate command must check _setup_ok before calling run_generate"
+    )
+
+
+# ---- R4 (Remediation Reassessment Round 4) tests ---------------------------
+
+def test_r4_01_vocab_invariant_validation():
+    """R4-01: Preflight must validate V >= VOCAB_N."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    preflight_fn = ino[ino.index("_psram_preflight("):]
+    preflight_fn = preflight_fn[:preflight_fn.index("\n}\n") + 3]
+    assert "vocab" in preflight_fn and "VOCAB_N" in preflight_fn, (
+        "preflight must validate model vocab against VOCAB_N"
+    )
+
+
+def test_r4_01_dim_invariant_validation():
+    """R4-01: Preflight must validate D <= 128 (head_actq capacity)."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    preflight_fn = ino[ino.index("_psram_preflight("):]
+    preflight_fn = preflight_fn[:preflight_fn.index("\n}\n") + 3]
+    assert "dim" in preflight_fn and "128" in preflight_fn, (
+        "preflight must validate model dim fits head_actq[128]"
+    )
+
+
+def test_r4_01_preflight_before_staging():
+    """R4-01: Preflight must run BEFORE stage_head_int8 call in setup."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    preflight_pos = ino.index("_psram_preflight(c)")
+    # Find the call site, not the function definition.
+    stage_pos = ino.index("stage_head_int8(&model.tok_emb)")
+    assert preflight_pos < stage_pos, (
+        "preflight must run before stage_head_int8 call"
+    )
+
+
+def test_r4_01_stage_head_returns_bool():
+    """R4-01: stage_head_int8 must return bool and check ps() for NULL."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    assert "static bool stage_head_int8(" in ino, (
+        "stage_head_int8 must return bool, not void"
+    )
+    stage_fn = ino[ino.index("static bool stage_head_int8("):]
+    stage_fn = stage_fn[:stage_fn.index("\n}\n") + 3]
+    assert "!head_w8 || !head_scale8" in stage_fn, (
+        "stage_head_int8 must NULL-check ps() results"
+    )
+    assert "return false" in stage_fn, (
+        "stage_head_int8 must return false on allocation failure"
+    )
+
+
+def test_r4_01_head_budget_in_preflight():
+    """R4-01: Preflight must check head staging allocation budget."""
+    ino = read_file("esp32_p4.ino")
+    assert ino is not None
+    preflight_fn = ino[ino.index("_psram_preflight("):]
+    preflight_fn = preflight_fn[:preflight_fn.index("\n}\n") + 3]
+    assert "head_w_size" in preflight_fn or "head_s_size" in preflight_fn, (
+        "preflight must include head allocation budget check"
+    )
+
+
+def test_r4_02_per_mac_overflow_budget():
+    """R4-02: Tracked peers must have per-MAC overflow budget."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "ESPNOW_RX_PEER_OVERFLOW" in en, (
+        "must define per-MAC overflow budget constant"
+    )
+    assert "overflow_count" in en, (
+        "MAC struct must have overflow_count field"
+    )
+    assert "overflow_window" in en, (
+        "MAC struct must have overflow_window field"
+    )
+
+
+def test_r4_02_peer_overflow_function():
+    """R4-02: Must have _espnow_peer_overflow_budget function."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    assert "_espnow_peer_overflow_budget" in en, (
+        "must have per-MAC overflow budget function"
+    )
+    peer_fn = en[en.index("_espnow_peer_overflow_budget"):]
+    peer_fn = peer_fn[:peer_fn.index("\n}\n") + 3]
+    assert "ESPNOW_RX_PEER_OVERFLOW" in peer_fn, (
+        "per-MAC overflow function must use ESPNOW_RX_PEER_OVERFLOW limit"
+    )
+
+
+def test_r4_02_tracked_peer_fast_lane():
+    """R4-02: RX callback must try per-MAC overflow before global overflow."""
+    en = read_file("espnow_comm.h")
+    assert en is not None
+    rx_fn = en[en.index("_espnow_rx("):]
+    rx_fn = rx_fn[:rx_fn.index("\n}\n") + 3]
+    peer_pos = rx_fn.index("_espnow_peer_overflow_budget")
+    global_pos = rx_fn.index("_espnow_verify_overflow_budget")
+    assert peer_pos < global_pos, (
+        "per-MAC overflow must be checked before global overflow in RX callback"
+    )
+
+
+def test_r4_03_two_phase_counter_journal():
+    """R4-03: OTA must use two-phase counter journal (stage → boot → commit)."""
+    verify = read_file("ota_verify.h")
+    assert verify is not None
+    assert "ota_verify_stage_counter" in verify, (
+        "must have ota_verify_stage_counter function"
+    )
+    assert 'ota_pending' in verify, (
+        "must use 'ota_pending' NVS key for staging"
+    )
+
+
+def test_r4_03_boot_time_recovery():
+    """R4-03: OTA must recover pending counter at boot."""
+    verify = read_file("ota_verify.h")
+    assert verify is not None
+    assert "_ota_verify_recover" in verify, (
+        "must have _ota_verify_recover function"
+    )
+    init_fn = verify[verify.index("ota_verify_init()"):]
+    init_fn = init_fn[:init_fn.index("\n}\n") + 3]
+    assert "_ota_verify_recover()" in init_fn, (
+        "ota_verify_init must call _ota_verify_recover"
+    )
+
+
+def test_r4_03_stage_before_boot_partition():
+    """R4-03: Counter must be staged BEFORE set_boot_partition."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    finalize_section = ota[ota.index("esp_ota_end(_ota.handle)"):]
+    stage_pos = finalize_section.index("ota_verify_stage_counter()")
+    boot_pos = finalize_section.index("esp_ota_set_boot_partition(_ota.part)")
+    assert stage_pos < boot_pos, (
+        "counter must be staged before set_boot_partition"
+    )
+
+
+def test_r4_03_commit_clears_pending():
+    """R4-03: Counter commit must clear the pending NVS key."""
+    verify = read_file("ota_verify.h")
+    assert verify is not None
+    commit_fn = verify[verify.index("static bool ota_verify_commit_counter()"):]
+    commit_fn = commit_fn[:commit_fn.index("\n}\n") + 3]
+    assert 'nvs_erase_key' in commit_fn and 'ota_pending' in commit_fn, (
+        "commit_counter must clear ota_pending key"
+    )
+
+
+def test_r4_03_rollback_result_check():
+    """R4-03: Boot partition rollback result must be checked."""
+    ota = read_file("ota_espnow.h")
+    assert ota is not None
+    rollback_section = ota[ota.index("counter commit failed"):]
+    rollback_section = rollback_section[:300]
+    assert "esp_ota_set_boot_partition(running) != ESP_OK" in rollback_section, (
+        "rollback esp_ota_set_boot_partition result must be checked"
+    )
+
+
+def test_r4_04_sender_init_ordering():
+    """R4-04: Sender must init OTA and replay BEFORE registering RX callback."""
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    ota_init_pos = sender.index("ota_push_init()")
+    replay_init_pos = sender.index("memset(_sender_replay")
+    rx_cb_pos = sender.index("esp_now_register_recv_cb(on_rx)")
+    assert ota_init_pos < rx_cb_pos, (
+        "ota_push_init must happen before esp_now_register_recv_cb"
+    )
+    assert replay_init_pos < rx_cb_pos, (
+        "memset(_sender_replay) must happen before esp_now_register_recv_cb"
+    )
+
+
+def test_r4_05_crypto_recovery_silence():
+    """R4-05: Crypto must define recovery silence threshold for retired ring."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "CRYPTO_RECOVERY_SILENCE_US" in crypto, (
+        "must define CRYPTO_RECOVERY_SILENCE_US"
+    )
+    assert "30000000" in crypto, (
+        "recovery silence must be 30s (30000000 us)"
+    )
+
+
+def test_r4_05_crypto_stale_eviction():
+    """R4-05: Crypto must define stale slot eviction threshold."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    assert "CRYPTO_SLOT_STALE_US" in crypto, (
+        "must define CRYPTO_SLOT_STALE_US"
+    )
+    assert "60000000" in crypto, (
+        "stale threshold must be 60s (60000000 us)"
+    )
+
+
+def test_r4_05_crypto_retired_recovery():
+    """R4-05: Crypto must FIFO evict oldest retired epoch after recovery silence."""
+    crypto = read_file("crypto_peer.h")
+    assert crypto is not None
+    verify_fn = crypto[crypto.index("crypto_verify("):]
+    verify_fn = verify_fn[:verify_fn.index("\n}\n") + 3]
+    # Recovery path: after retired ring full, check recovery silence then FIFO.
+    retired_check = verify_fn.index("retired_count >= CRYPTO_RETIRED_EPOCHS")
+    recovery_section = verify_fn[retired_check:retired_check + 400]
+    assert "CRYPTO_RECOVERY_SILENCE_US" in recovery_section, (
+        "retired ring recovery must check CRYPTO_RECOVERY_SILENCE_US"
+    )
+    assert ".retired_count--" in recovery_section, (
+        "recovery must decrement retired_count after FIFO eviction"
+    )
+
+
+def test_r4_05_sender_recovery():
+    """R4-05: Sender must have the same recovery pattern."""
+    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    assert "SENDER_RECOVERY_SILENCE_MS" in sender, (
+        "sender must define SENDER_RECOVERY_SILENCE_MS"
+    )
+    assert "SENDER_SLOT_STALE_MS" in sender, (
+        "sender must define SENDER_SLOT_STALE_MS"
+    )
+    # Check FIFO eviction in sender.
+    retired_idx = sender.index("retired_count >= SENDER_RETIRED_EPOCHS")
+    recovery_section = sender[retired_idx:retired_idx + 400]
+    assert "SENDER_RECOVERY_SILENCE_MS" in recovery_section, (
+        "sender retired ring recovery must check SENDER_RECOVERY_SILENCE_MS"
+    )
+    assert ".retired_count--" in recovery_section, (
+        "sender must decrement retired_count after FIFO eviction"
     )
 
 

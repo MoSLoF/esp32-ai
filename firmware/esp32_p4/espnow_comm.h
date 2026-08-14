@@ -43,17 +43,22 @@ static const uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // FR-06: reserved authenticated budget prevents unauthenticated traffic
 // from starving verified peers.
 // R3-03: overflow verification budget bounds HMAC attempts from unknown MACs.
+// R4-02: tracked peers get per-MAC overflow budget; unknown MACs share global.
 #define ESPNOW_RX_LIMIT           100
 #define ESPNOW_RX_MAC_SLOTS       8
 #define ESPNOW_RX_GLOBAL_CEIL     500
 #define ESPNOW_RX_AUTHED_RESERVE  100
 #define ESPNOW_RX_VERIFY_OVERFLOW 50
+#define ESPNOW_RX_PEER_OVERFLOW   10
 
 static struct {
   uint8_t mac[6];
   uint16_t count;
   int64_t window;
   bool active;
+  // R4-02: per-MAC overflow budget for tracked peers.
+  uint16_t overflow_count;
+  int64_t overflow_window;
 } _espnow_rx_mac[ESPNOW_RX_MAC_SLOTS];
 static uint32_t _espnow_rx_global = 0;
 static int64_t _espnow_rx_global_window = 0;
@@ -190,6 +195,21 @@ static bool _espnow_verify_overflow_budget(int64_t now_us) {
   return (++_espnow_rx_verify_overflow_count <= ESPNOW_RX_VERIFY_OVERFLOW);
 }
 
+// R4-02: per-MAC overflow budget for tracked peers.
+static bool _espnow_peer_overflow_budget(const uint8_t *mac, int64_t now_us) {
+  for (int i = 0; i < ESPNOW_RX_MAC_SLOTS; i++) {
+    if (_espnow_rx_mac[i].active &&
+        memcmp(_espnow_rx_mac[i].mac, mac, 6) == 0) {
+      if (now_us - _espnow_rx_mac[i].overflow_window > 1000000) {
+        _espnow_rx_mac[i].overflow_count = 0;
+        _espnow_rx_mac[i].overflow_window = now_us;
+      }
+      return (++_espnow_rx_mac[i].overflow_count <= ESPNOW_RX_PEER_OVERFLOW);
+    }
+  }
+  return false;
+}
+
 // RX callback -- runs in the WiFi task context, so keep it fast.
 static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
@@ -208,10 +228,14 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
   // EA-08: when crypto is enabled, verify ALL frame types.
   int verified_len = len;
   if (_espnow_verify_fn) {
-    // R3-03: when pre-auth exhausted, use overflow budget to bound HMAC attempts.
-    if (!preauth_ok && !_espnow_verify_overflow_budget(now_us)) {
-      _espnow_diag_preauth_drop++;
-      return;
+    // R4-02: when pre-auth exhausted, tracked peers use per-MAC overflow;
+    // unknown MACs use global overflow budget.
+    if (!preauth_ok) {
+      bool overflow_ok = _espnow_peer_overflow_budget(info->src_addr, now_us);
+      if (!overflow_ok && !_espnow_verify_overflow_budget(now_us)) {
+        _espnow_diag_preauth_drop++;
+        return;
+      }
     }
     verified_len = _espnow_verify_fn(info->src_addr, data, len);
     if (verified_len <= 0) return;

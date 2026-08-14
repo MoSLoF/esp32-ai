@@ -56,6 +56,9 @@ static uint32_t _crypto_tx_seq = 0;
 #define CRYPTO_REPLAY_SLOTS 16
 #define CRYPTO_EPOCH_SILENCE_US 5000000  // 5s silence before accepting new epoch
 #define CRYPTO_RETIRED_EPOCHS 4
+// R4-05: recovery thresholds for authenticated peers.
+#define CRYPTO_RECOVERY_SILENCE_US 30000000  // 30s silence before recovery eviction
+#define CRYPTO_SLOT_STALE_US       60000000  // 60s stale threshold for slot eviction
 static struct {
   uint8_t mac[6];
   uint32_t epoch;
@@ -127,8 +130,15 @@ static int crypto_verify(const uint8_t *src_mac,
       if (silence < CRYPTO_EPOCH_SILENCE_US)
         return 0;
       // R3-01: fail closed — reject when retired ring is full.
-      if (_crypto_replay[slot].retired_count >= CRYPTO_RETIRED_EPOCHS)
-        return 0;
+      // R4-05: authenticated recovery — if HMAC verified, silence exceeded
+      // recovery threshold, FIFO evict oldest retired epoch.
+      if (_crypto_replay[slot].retired_count >= CRYPTO_RETIRED_EPOCHS) {
+        if (silence < CRYPTO_RECOVERY_SILENCE_US)
+          return 0;
+        for (int ri = 1; ri < _crypto_replay[slot].retired_count; ri++)
+          _crypto_replay[slot].retired[ri - 1] = _crypto_replay[slot].retired[ri];
+        _crypto_replay[slot].retired_count--;
+      }
       _crypto_replay[slot].retired[_crypto_replay[slot].retired_count++] =
           _crypto_replay[slot].epoch;
       _crypto_replay[slot].epoch = epoch;
@@ -137,8 +147,13 @@ static int crypto_verify(const uint8_t *src_mac,
     _crypto_replay[slot].last_seen_us = now_us;
   } else {
     // R3-01: fail closed — reject unknown MACs when all slots are active.
-    if (_crypto_replay[evict].active)
-      return 0;
+    // R4-05: authenticated stale eviction — if HMAC verified and oldest
+    // slot is stale (inactive > CRYPTO_SLOT_STALE_US), evict it.
+    if (_crypto_replay[evict].active) {
+      int64_t age = now_us - _crypto_replay[evict].last_seen_us;
+      if (age < CRYPTO_SLOT_STALE_US)
+        return 0;
+    }
     memcpy(_crypto_replay[evict].mac, src_mac, 6);
     _crypto_replay[evict].epoch = epoch;
     _crypto_replay[evict].retired_count = 0;

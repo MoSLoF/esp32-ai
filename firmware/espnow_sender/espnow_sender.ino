@@ -62,6 +62,9 @@ static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 #define SENDER_REPLAY_SLOTS 4
 #define SENDER_EPOCH_SILENCE_MS 5000
 #define SENDER_RETIRED_EPOCHS 4
+// R4-05: recovery thresholds for authenticated peers.
+#define SENDER_RECOVERY_SILENCE_MS 30000
+#define SENDER_SLOT_STALE_MS       60000
 static struct {
   uint8_t mac[6];
   uint32_t epoch;
@@ -126,7 +129,14 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
         // Require silence period before accepting new epoch.
         if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_EPOCH_SILENCE_MS) return;
         // R3-01: fail closed — reject when retired ring is full.
-        if (_sender_replay[slot].retired_count >= SENDER_RETIRED_EPOCHS) return;
+        // R4-05: authenticated recovery — FIFO evict oldest retired epoch
+        // after extended silence.
+        if (_sender_replay[slot].retired_count >= SENDER_RETIRED_EPOCHS) {
+          if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_RECOVERY_SILENCE_MS) return;
+          for (int ri = 1; ri < _sender_replay[slot].retired_count; ri++)
+            _sender_replay[slot].retired[ri - 1] = _sender_replay[slot].retired[ri];
+          _sender_replay[slot].retired_count--;
+        }
         _sender_replay[slot].retired[_sender_replay[slot].retired_count++] =
             _sender_replay[slot].epoch;
         _sender_replay[slot].epoch = ep;
@@ -135,7 +145,10 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
       _sender_replay[slot].last_seen_ms = now_ms;
     } else {
       // R3-01: fail closed — reject unknown MACs when all slots active.
-      if (_sender_replay[evict].active) return;
+      // R4-05: authenticated stale eviction — evict oldest slot if stale.
+      if (_sender_replay[evict].active) {
+        if (now_ms - _sender_replay[evict].last_seen_ms < SENDER_SLOT_STALE_MS) return;
+      }
       memcpy(_sender_replay[evict].mac, info->src_addr, 6);
       _sender_replay[evict].epoch = ep;
       _sender_replay[evict].retired_count = 0;
@@ -210,6 +223,11 @@ void setup() {
                 _sender_epoch);
 #endif
 
+  // R4-04: initialize all callback-consumed state BEFORE registering
+  // the RX callback to prevent processing frames with uninitialized data.
+  ota_push_init();
+  memset(_sender_replay, 0, sizeof(_sender_replay));
+
   esp_now_register_recv_cb(on_rx);
 
   esp_now_peer_info_t peer = {};
@@ -217,9 +235,6 @@ void setup() {
   peer.channel = 0;
   peer.encrypt = false;
   esp_now_add_peer(&peer);
-
-  ota_push_init();
-  memset(_sender_replay, 0, sizeof(_sender_replay));
 
   Serial.println("ready. type a prompt (or number 1-4):");
   for (int i = 0; i < N_PROMPTS; i++)
