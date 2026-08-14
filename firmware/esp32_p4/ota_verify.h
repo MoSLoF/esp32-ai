@@ -82,6 +82,24 @@ static struct {
 static mbedtls_sha256_context _otav_sha_ctx;
 static bool _otav_sha_active = false;
 
+// R4-03: recover pending counter on boot — if a staged counter exists
+// from a power-loss between stage and commit, finalize it now.
+static void _ota_verify_recover() {
+  uint32_t pending = 0;
+  esp_err_t err = nvs_get_u32(_otav_nvs, "ota_pending", &pending);
+  if (err == ESP_OK && pending > 0) {
+    uint32_t current = 0;
+    nvs_get_u32(_otav_nvs, "sec_ctr", &current);
+    if (pending > current) {
+      nvs_set_u32(_otav_nvs, "sec_ctr", pending);
+      nvs_commit(_otav_nvs);
+      Serial.printf("[ota-verify] recovered pending counter %u\n", pending);
+    }
+    nvs_erase_key(_otav_nvs, "ota_pending");
+    nvs_commit(_otav_nvs);
+  }
+}
+
 static bool ota_verify_init() {
   esp_err_t err = nvs_open("ota_sec", NVS_READWRITE, &_otav_nvs);
   if (err != ESP_OK) {
@@ -90,6 +108,9 @@ static bool ota_verify_init() {
   }
   memset(&_otav_manifest, 0, sizeof(_otav_manifest));
   _otav_ready = true;
+
+  // R4-03: check for pending counter from interrupted OTA.
+  _ota_verify_recover();
 
   uint32_t ctr = 0;
   nvs_get_u32(_otav_nvs, "sec_ctr", &ctr);
@@ -205,7 +226,20 @@ static bool ota_verify_sha_finish() {
   return true;
 }
 
+// R4-03: stage the counter to NVS as "pending" before changing boot partition.
+static bool ota_verify_stage_counter() {
+  if (!_otav_manifest.valid) return false;
+  esp_err_t e1 = nvs_set_u32(_otav_nvs, "ota_pending", _otav_manifest.sec_counter);
+  esp_err_t e2 = nvs_commit(_otav_nvs);
+  if (e1 != ESP_OK || e2 != ESP_OK) {
+    Serial.printf("[ota-verify] stage counter failed: set=%d commit=%d\n", e1, e2);
+    return false;
+  }
+  return true;
+}
+
 // FR-08: commit security counter AFTER all checks pass (CRC + SHA + OTA end).
+// R4-03: also clears the pending key to complete the two-phase journal.
 static bool ota_verify_commit_counter() {
   if (!_otav_manifest.valid) return false;
   esp_err_t e1 = nvs_set_u32(_otav_nvs, "sec_ctr", _otav_manifest.sec_counter);
@@ -214,6 +248,9 @@ static bool ota_verify_commit_counter() {
     Serial.printf("[ota-verify] NVS commit failed: set=%d commit=%d\n", e1, e2);
     return false;
   }
+  // R4-03: clear pending key to complete two-phase journal.
+  nvs_erase_key(_otav_nvs, "ota_pending");
+  nvs_commit(_otav_nvs);
   Serial.printf("[ota-verify] counter updated to %u\n", _otav_manifest.sec_counter);
   return true;
 }

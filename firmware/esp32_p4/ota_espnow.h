@@ -347,30 +347,38 @@ static void ota_tick() {
               _ota_tx_status(OTA_STATUS_ERROR);
               _ota.state = OTA_IDLE;
             } else {
-              // FR-08: check set_boot_partition return value.
-              esp_err_t eb = esp_ota_set_boot_partition(_ota.part);
-              if (eb != ESP_OK) {
-                Serial.printf("[ota] set_boot_partition failed: %d\n", eb);
+              // R4-03: two-phase counter journal: stage → set_boot → commit.
+              if (!ota_verify_stage_counter()) {
+                Serial.println("[ota] counter staging failed");
                 _ota_tx_status(OTA_STATUS_ERROR);
                 _ota.state = OTA_IDLE;
+                ota_verify_reset();
               } else {
-                // FR-08/R2-06: commit counter AFTER all finalization succeeds.
-                // R3-04: if counter commit fails, restore boot partition to
-                // the running partition to prevent booting un-countered firmware.
-                if (!ota_verify_commit_counter()) {
-                  Serial.println("[ota] counter commit failed, restoring boot partition");
-                  const esp_partition_t *running = esp_ota_get_running_partition();
-                  if (running)
-                    esp_ota_set_boot_partition(running);
+                esp_err_t eb = esp_ota_set_boot_partition(_ota.part);
+                if (eb != ESP_OK) {
+                  Serial.printf("[ota] set_boot_partition failed: %d\n", eb);
                   _ota_tx_status(OTA_STATUS_ERROR);
                   _ota.state = OTA_IDLE;
                   ota_verify_reset();
                 } else {
-                  _ota_tx_status(OTA_STATUS_COMPLETE);
-                  Serial.println("[ota] update complete, rebooting in 2s...");
-                  _ota.state = OTA_DONE;
-                  delay(2000);
-                  esp_restart();
+                  // R4-03: commit counter and clear pending to complete journal.
+                  if (!ota_verify_commit_counter()) {
+                    Serial.println("[ota] counter commit failed, restoring boot partition");
+                    const esp_partition_t *running = esp_ota_get_running_partition();
+                    // R4-03: check rollback result.
+                    if (!running || esp_ota_set_boot_partition(running) != ESP_OK) {
+                      Serial.println("[ota] CRITICAL: rollback failed");
+                    }
+                    _ota_tx_status(OTA_STATUS_ERROR);
+                    _ota.state = OTA_IDLE;
+                    ota_verify_reset();
+                  } else {
+                    _ota_tx_status(OTA_STATUS_COMPLETE);
+                    Serial.println("[ota] update complete, rebooting in 2s...");
+                    _ota.state = OTA_DONE;
+                    delay(2000);
+                    esp_restart();
+                  }
                 }
               }
             }
