@@ -32,6 +32,15 @@ COMMON_DIR = Path(__file__).parent.parent / "firmware" / "common"
 SENDER_DIR = Path(__file__).parent.parent / "firmware" / "espnow_sender"
 HOST_VERIFY_DIR = Path(__file__).parent.parent / "firmware" / "host_verify"
 
+
+def read_sender_all():
+    """espnow_sender.ino + sender_replay.h concatenated. R5-01 extracted the
+    sender's replay/epoch state machine out of the .ino into sender_replay.h
+    (for host testability); tests that check for replay-logic content
+    without caring which specific file it lives in should use this."""
+    return ((SENDER_DIR / "espnow_sender.ino").read_text() + "\n" +
+            (SENDER_DIR / "sender_replay.h").read_text())
+
 # All feature flags and their required headers.
 FEATURE_FLAGS = {
     "USE_DISPLAY":       "display.h",
@@ -990,7 +999,7 @@ def test_fr02_verify_fn_has_mac():
 
 def test_fr02_sender_replay_table():
     """FR-02: Sender must have replay protection on RX path."""
-    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    sender = read_sender_all()
     assert "_sender_replay" in sender, (
         "sender must have replay table"
     )
@@ -1212,7 +1221,7 @@ def test_r2_02_retired_epoch_ring():
 
 def test_r2_02_sender_epoch_silence():
     """R2-02: Sender replay must require silence period for new epochs."""
-    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    sender = read_sender_all()
     assert "SENDER_EPOCH_SILENCE_MS" in sender, (
         "sender must define epoch silence period"
     )
@@ -1220,7 +1229,7 @@ def test_r2_02_sender_epoch_silence():
     assert "sender_next_persistent_epoch" in sender, (
         "sender epoch must come from a persistent monotonic counter"
     )
-    assert "ep > _sender_replay[slot].epoch" in sender, (
+    assert "epoch > _sender_replay[slot].epoch" in sender, (
         "sender epoch comparison must be strictly monotonic"
     )
 
@@ -1416,7 +1425,7 @@ def test_r3_01_sender_fail_closed():
     """R3-01/R5-01: Sender replay must permanently reject a superseded epoch
     and must still be fail-closed for unknown MACs when all slots are active.
     """
-    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    sender = read_sender_all()
     assert "sender_next_persistent_epoch" in sender, (
         "sender epoch must come from a persistent monotonic counter"
     )
@@ -1462,7 +1471,7 @@ def test_r3_02_crypto_before_begin():
 def test_r3_02_sender_crypto_before_rx():
     """R3-02: Sender must init crypto before registering RX callback."""
     sender = (SENDER_DIR / "espnow_sender.ino").read_text()
-    crypto_pos = sender.index("_sender_epoch = sender_next_persistent_epoch()")
+    crypto_pos = sender.index("sender_next_persistent_epoch(&_sender_epoch)")
     rx_cb_pos = sender.index("esp_now_register_recv_cb(on_rx)")
     assert crypto_pos < rx_cb_pos, (
         "sender crypto init must happen before esp_now_register_recv_cb"
@@ -1730,7 +1739,7 @@ def test_r4_03_commit_clears_pending():
     assert '_ota_verify_clear_journal' in commit_fn, (
         "commit_counter must clear the pending journal"
     )
-    clear_fn = verify[verify.index("static void _ota_verify_clear_journal("):]
+    clear_fn = verify[verify.index("static bool _ota_verify_clear_journal("):]
     clear_fn = clear_fn[:clear_fn.index("\n}\n") + 3]
     for key in ("pend_phase", "pend_ctr", "pend_part"):
         assert f'"{key}"' in clear_fn and 'nvs_erase_key' in clear_fn, (
@@ -1753,13 +1762,20 @@ def test_r4_04_sender_init_ordering():
     """R4-04: Sender must init OTA and replay BEFORE registering RX callback."""
     sender = (SENDER_DIR / "espnow_sender.ino").read_text()
     ota_init_pos = sender.index("ota_push_init()")
-    replay_init_pos = sender.index("memset(_sender_replay")
+    # R5-01: replay init (memset + persisted-floor reload) was extracted
+    # into sender_replay_init() (sender_replay.h); the .ino just calls it.
+    replay_init_pos = sender.index("sender_replay_init()")
     rx_cb_pos = sender.index("esp_now_register_recv_cb(on_rx)")
     assert ota_init_pos < rx_cb_pos, (
         "ota_push_init must happen before esp_now_register_recv_cb"
     )
     assert replay_init_pos < rx_cb_pos, (
-        "memset(_sender_replay) must happen before esp_now_register_recv_cb"
+        "sender_replay_init() must happen before esp_now_register_recv_cb"
+    )
+
+    replay_h = (SENDER_DIR / "sender_replay.h").read_text()
+    assert "memset(_sender_replay" in replay_h, (
+        "sender_replay_init() must reset the in-RAM replay table"
     )
 
 
@@ -1813,7 +1829,7 @@ def test_r4_05_sender_recovery():
     """R4-05/R5-01: sender must match crypto_peer.h's monotonic-epoch fix
     and must still evict stale, inactive replay slots (unrelated concern).
     """
-    sender = (SENDER_DIR / "espnow_sender.ino").read_text()
+    sender = read_sender_all()
     assert "SENDER_RECOVERY_SILENCE_MS" not in sender, (
         "time-based retired-epoch recovery must not be reintroduced (R5-01)"
     )
@@ -1886,16 +1902,39 @@ def _compile_and_run_host_test(c_filename):
 
 
 def test_r5_01_replay_epoch_behavioral():
-    """R5-01 (HIGH): replay recovery must not reopen a retired epoch.
+    """R5-01 (HIGH): replay recovery must not reopen a closed replay window.
 
-    Executes crypto_peer.h's actual replay state machine through the exact
-    attack sequence from the reassessment: a sender progresses through six
-    epochs (more than the old design's 4-entry retired ring), and a frame
-    captured under the first epoch must remain rejected forever afterward
-    -- through repeated recovery-length silences and a simulated receiver
-    restart -- not just until the ring's FIFO eviction happens to age it out.
+    Executes crypto_peer.h's actual replay state machine through two attack
+    sequences: (1) the original reassessment finding -- a sender progresses
+    through six epochs (more than the old design's 4-entry retired ring),
+    and a frame captured under the first epoch must remain rejected forever
+    afterward, through repeated recovery-length silences and a simulated
+    receiver restart, not just until the ring's FIFO eviction ages it out;
+    and (2) a follow-up verification memo's finding on top of that fix -- a
+    captured frame from the sender's CURRENT (still-valid) epoch must also
+    remain rejected across a receiver-only reboot, which requires a durable
+    per-sender sequence watermark (not just an epoch floor), including NVS
+    fault-injection scenarios proving persistence failures fail closed with
+    no random-epoch fallback anywhere in the init path.
     """
     rc, output = _compile_and_run_host_test("crypto_replay_test.c")
+    assert rc == 0, f"behavioral test failed:\n{output}"
+
+
+def test_r5_01_sender_replay_behavioral():
+    """R5-01 (HIGH, verification-memo follow-up): sender-side replay/epoch
+    state machine must match crypto_peer.h's receiver-side guarantees.
+
+    Executes sender_replay.h's actual state machine (extracted from
+    espnow_sender.ino specifically so it's host-testable) through the same
+    scenarios as test_r5_01_replay_epoch_behavioral: retired-epoch replay
+    across a sender reboot, same-epoch/higher-seq replay across a sender
+    reboot (the core verification-memo finding, mirrored to the sender side
+    which previously had NO persisted floor at all for its peer), and NVS
+    fault injection proving persistence failures fail closed with no
+    random-epoch fallback.
+    """
+    rc, output = _compile_and_run_host_test("sender_replay_test.c")
     assert rc == 0, f"behavioral test failed:\n{output}"
 
 
@@ -1917,17 +1956,21 @@ def test_r5_02_mac_starvation_behavioral():
 
 def test_r5_03_ota_journal_behavioral():
     """R5-03 (MEDIUM): the OTA counter/partition journal must stay
-    consistent across power loss at every phase boundary.
+    consistent across power loss and NVS faults at every phase boundary.
 
     Executes ota_verify.h's actual staging/commit/recovery functions
     (including _ota_verify_recover(), invoked exactly as the real firmware
-    calls it from ota_verify_init() at boot) across five scenarios: power
+    calls it from ota_verify_init() at boot) across scenarios A-I: power
     loss before the boot-partition switch takes effect (must NOT burn the
     counter, and the same manifest must be retryable afterward), power loss
     after the switch but before commit (must finish committing), a clean
-    same-boot completion, esp_ota_set_boot_partition() itself failing, and
-    a crash during final journal cleanup after the counter is already
-    committed.
+    same-boot completion, esp_ota_set_boot_partition() itself failing, a
+    crash during final journal cleanup after the counter is already
+    committed, and -- the verification memo's follow-up finding -- NVS
+    fault injection during recovery's own counter commit and pending-field
+    reads (must leave the journal intact and block further OTA acceptance
+    until a later boot converges, never silently clearing the only durable
+    record of an unresolved transaction).
     """
     rc, output = _compile_and_run_host_test("ota_journal_test.c")
     assert rc == 0, f"behavioral test failed:\n{output}"

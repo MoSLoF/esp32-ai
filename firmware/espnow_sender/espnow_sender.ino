@@ -21,6 +21,7 @@
 #include <nvs.h>
 #include "../esp32_llm/vocab.h"   // shared token->text table for decoding RX
 #include "../common/crypto_envelope.h"
+#include "sender_replay.h"
 #include "ota_push.h"
 
 #define ESPNOW_MSG_TOKEN  0x01
@@ -44,6 +45,11 @@ static uint32_t _sender_tx_seq = 0;
 // data (R5-02) so a captured valid frame can't be replayed under a
 // different claimed source MAC.
 static uint8_t _sender_own_mac[6];
+// R5-01 (verification-memo hardening): set only once epoch allocation and
+// replay-floor persistence both succeed. sender_send()/on_rx() refuse to
+// operate at all while this is false -- no random-epoch fallback, no
+// unauthenticated pass-through.
+static bool _sender_crypto_ready = false;
 #endif
 
 // Hardcoded prompt token tables. In a full system you'd run a tokenizer
@@ -64,47 +70,13 @@ static const PromptEntry PROMPTS[] = {
 };
 static const int N_PROMPTS = sizeof(PROMPTS) / sizeof(PROMPTS[0]);
 
-// FR-02/R2-02: sender-side replay table with silence period.
-#define SENDER_REPLAY_SLOTS 4
-#define SENDER_EPOCH_SILENCE_MS 5000
-// R4-05: stale threshold for slot eviction (unrelated to epoch ordering).
-#define SENDER_SLOT_STALE_MS       60000
-static struct {
-  uint8_t mac[6];
-  uint32_t epoch;
-  uint32_t last_seq;
-  unsigned long last_seen_ms;
-  bool active;
-} _sender_replay[SENDER_REPLAY_SLOTS];
-
-// R5-01: persistent monotonic epoch — mirrors crypto_peer.h's
-// crypto_next_persistent_epoch(). A random per-boot epoch has no ordering
-// relation across reboots, which is what forced the old design into a
-// bounded "retired epoch" ring that had to evict (and thus eventually
-// re-admit) entries to stay fail-closed. An NVS-persisted, monotonically
-// increasing counter makes a superseded epoch invalid forever.
-static uint32_t sender_next_persistent_epoch() {
-  nvs_handle_t h;
-  if (nvs_open("crypto_ep", NVS_READWRITE, &h) == ESP_OK) {
-    uint32_t epoch = 0;
-    nvs_get_u32(h, "boot_ctr", &epoch);
-    epoch++;
-    esp_err_t e1 = nvs_set_u32(h, "boot_ctr", epoch);
-    esp_err_t e2 = nvs_commit(h);
-    nvs_close(h);
-    if (e1 == ESP_OK && e2 == ESP_OK) return epoch;
-  }
-  Serial.println("[crypto] WARNING: persistent epoch counter unavailable — "
-                 "falling back to a random, non-monotonic epoch");
-  return esp_random();
-}
-
 // Peer protocol frame type for passive scanning.
 #define ESPNOW_MSG_IDENTITY 0x04
 
 // EA-04: sign and send a frame.
 static void sender_send(const uint8_t *dest, uint8_t *frame, int len) {
 #if USE_CRYPTO
+  if (!_sender_crypto_ready) return;  // R5-01: no safe signing path -- refuse to send
   if (len > 0) {
     uint32_t seq = _sender_tx_seq++;
     len = crypto_env_sign(_sender_psk, _sender_own_mac, frame, len, _sender_epoch, seq);
@@ -117,6 +89,13 @@ static void sender_send(const uint8_t *dest, uint8_t *frame, int len) {
 // and dispatch OTA frames.
 static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
+#if USE_CRYPTO
+  // R5-01: fail closed -- no safe verification path without a ready
+  // epoch/floor. Must run before anything else in on_rx(), including the
+  // OTA dispatch at the bottom, so no unauthenticated traffic (OTA or
+  // otherwise) is ever processed while crypto never came up.
+  if (!_sender_crypto_ready) return;
+#endif
 
   // EA-04: verify incoming frames when crypto is enabled.
   // FR-02: sender-side replay protection.
@@ -126,50 +105,7 @@ static void on_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     uint32_t ep, sq;
     verified_len = crypto_env_verify(_sender_psk, info->src_addr, data, len, &ep, &sq);
     if (verified_len <= 0) return;
-
-    // R2-02: replay check with silence period and retired epoch ring.
-    int slot = -1, evict = 0;
-    unsigned long oldest = ULONG_MAX;
-    for (int i = 0; i < SENDER_REPLAY_SLOTS; i++) {
-      if (_sender_replay[i].active &&
-          memcmp(_sender_replay[i].mac, info->src_addr, 6) == 0) {
-        slot = i; break;
-      }
-      if (!_sender_replay[i].active) { evict = i; oldest = 0; }
-      else if (_sender_replay[i].last_seen_ms < oldest) {
-        oldest = _sender_replay[i].last_seen_ms; evict = i;
-      }
-    }
-    unsigned long now_ms = millis();
-    if (slot >= 0) {
-      if (ep == _sender_replay[slot].epoch) {
-        if (sq <= _sender_replay[slot].last_seq) return;
-        _sender_replay[slot].last_seq = sq;
-      } else if (ep > _sender_replay[slot].epoch) {
-        // New epoch — require silence period before accepting, as
-        // defense-in-depth against rapid epoch churn.
-        if (now_ms - _sender_replay[slot].last_seen_ms < SENDER_EPOCH_SILENCE_MS) return;
-        _sender_replay[slot].epoch = ep;
-        _sender_replay[slot].last_seq = sq;
-      } else {
-        // R5-01: epoch is a persistent monotonic sender boot counter, so
-        // any epoch not strictly greater than the highest ever accepted
-        // is permanently retired — no eviction path can reopen it.
-        return;
-      }
-      _sender_replay[slot].last_seen_ms = now_ms;
-    } else {
-      // R3-01: fail closed — reject unknown MACs when all slots active.
-      // R4-05: authenticated stale eviction — evict oldest slot if stale.
-      if (_sender_replay[evict].active) {
-        if (now_ms - _sender_replay[evict].last_seen_ms < SENDER_SLOT_STALE_MS) return;
-      }
-      memcpy(_sender_replay[evict].mac, info->src_addr, 6);
-      _sender_replay[evict].epoch = ep;
-      _sender_replay[evict].last_seq = sq;
-      _sender_replay[evict].last_seen_ms = now_ms;
-      _sender_replay[evict].active = true;
-    }
+    if (!sender_replay_check(info->src_addr, ep, sq)) return;
   }
 #endif
 
@@ -237,29 +173,44 @@ void setup() {
 
   // R3-02: initialize crypto state BEFORE registering RX callback so
   // on_rx never processes frames without authentication.
+  // R5-01 (verification-memo hardening): epoch allocation and replay-floor
+  // persistence are now both fallible with no fallback -- ESP-NOW is only
+  // enabled if both succeed.
 #if USE_CRYPTO
-  _sender_epoch = sender_next_persistent_epoch();
+  bool _epoch_ok = sender_next_persistent_epoch(&_sender_epoch);
   _sender_tx_seq = 0;
   esp_read_mac(_sender_own_mac, ESP_MAC_WIFI_STA);
-  _otap_epoch_ptr = &_sender_epoch;
-  _otap_tx_seq_ptr = &_sender_tx_seq;
-  _otap_crypto_enabled = true;
-  Serial.printf("[crypto] HMAC-SHA256 enabled (epoch=0x%08X)\n",
-                _sender_epoch);
+  bool _floor_ok = sender_replay_init();
+  _sender_crypto_ready = _epoch_ok && _floor_ok;
+  if (_sender_crypto_ready) {
+    _otap_epoch_ptr = &_sender_epoch;
+    _otap_tx_seq_ptr = &_sender_tx_seq;
+    _otap_crypto_enabled = true;
+    Serial.printf("[crypto] HMAC-SHA256 enabled (epoch=0x%08X)\n", _sender_epoch);
+  } else {
+    Serial.println("[crypto] CRITICAL: init failed -- ESP-NOW will remain disabled");
+  }
 #endif
 
   // R4-04: initialize all callback-consumed state BEFORE registering
   // the RX callback to prevent processing frames with uninitialized data.
   ota_push_init();
-  memset(_sender_replay, 0, sizeof(_sender_replay));
 
-  esp_now_register_recv_cb(on_rx);
+#if USE_CRYPTO
+  if (_sender_crypto_ready) {
+#endif
+    esp_now_register_recv_cb(on_rx);
 
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, BROADCAST, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, BROADCAST, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+#if USE_CRYPTO
+  } else {
+    Serial.println("[espnow] disabled: crypto init failed, refusing unauthenticated ESP-NOW");
+  }
+#endif
 
   Serial.println("ready. type a prompt (or number 1-4):");
   for (int i = 0; i < N_PROMPTS; i++)

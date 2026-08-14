@@ -1,26 +1,37 @@
 // R5-01 behavioral regression test: replay recovery must not reopen a
-// retired epoch.
+// closed replay window -- neither a retired (superseded) epoch, nor a
+// previously-used sequence number within the sender's CURRENT epoch.
 //
 // This compiles and executes the ACTUAL crypto_peer.h replay state machine
 // (via the ESP-IDF/Arduino stubs in stubs/) rather than re-implementing its
 // logic -- a fix or regression in the real firmware source shows up here.
 // Time and NVS are test-controlled (see stubs/esp_timer.h, stubs/nvs.h) so
-// the multi-epoch, multi-reboot attack sequence from the reassessment can
-// be reproduced deterministically without real delays or hardware.
+// multi-epoch, multi-reboot attack sequences -- and NVS fault injection
+// (stubs/nvs.h's host_nvs_fault) -- can be reproduced deterministically
+// without real delays or hardware.
 //
-// Reassessment attack sequence (R5-01, HIGH):
+// Reassessment attack sequence (R5-01, HIGH, original finding):
 //   A sender progresses through epochs A, B, C, D, E. After the retired
 //   ring (old design: 4 entries) fills and 30s of silence pass, the ring
 //   FIFO-evicts A. An attacker then replays a frame captured under epoch A,
 //   and after the ordinary new-epoch silence period, epoch A is accepted
-//   again -- reopening its replay window.
+//   again -- reopening its replay window. (Fixed by a persistent monotonic
+//   epoch with no bounded/evictable history -- see the epoch-transition
+//   scenarios below.)
 //
-// Acceptance criteria (mirrors the Developer Acceptance Checklist):
-//   A frame from epoch A must remain rejected after at least five
-//   subsequent epoch transitions, extended recovery delays, and a receiver
-//   restart (simulated by re-running the replay-slot logic against the
-//   same persistent NVS state) -- forever, not just past one eviction
-//   window.
+// Verification-memo finding (R5-01, HIGH, on top of that fix):
+//   The fix above persisted each sender's EPOCH floor (mac+epoch) across a
+//   receiver reboot, but never persisted last_seq -- crypto_init() reset it
+//   to 0 every boot. So a captured frame from the sender's CURRENT (still
+//   valid, not retired) epoch, with any seq > 0, was accepted again
+//   immediately after a receiver-only reboot: seq > last_seq(0) trivially
+//   passes. Repro: accept (mac M, epoch 20, seq 50); reboot receiver only
+//   (sender stays at epoch 20); replay the exact captured (epoch=20,
+//   seq=50) frame first; it was accepted again. Fixed by persisting a
+//   durable seq WATERMARK ("accepted_through") per sender, reserved ahead
+//   of the live seq in chunks of CRYPTO_SEQ_WINDOW, and restoring last_seq
+//   from that watermark (not 0) on load -- see the same-epoch scenarios
+//   below.
 //
 // Build: gcc -std=c11 -I stubs -o /tmp/crypto_replay_test crypto_replay_test.c
 // Run:   /tmp/crypto_replay_test   (exit 0 = pass, non-zero = fail)
@@ -65,30 +76,32 @@ static int sign_test_frame(uint8_t *frame, uint32_t epoch, uint32_t seq,
 }
 
 int main(void) {
-  // Distinct from ATTACK_SENDER_MAC below -- R5-01's persisted per-MAC
-  // epoch floor (see crypto_peer.h's _crypto_persist_epoch_floors) means
-  // any frame accepted here would otherwise establish a floor that the
-  // attack sequence's own "epoch A" would collide with.
-  static const uint8_t SANITY_MAC[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-  static const uint8_t SENDER_MAC[6] = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01};
+  // Each scenario below uses a MAC distinct from every other scenario's --
+  // R5-01's persisted per-MAC floor/watermark means any frame accepted in
+  // one scenario would otherwise establish state that a later scenario's
+  // own fresh-start assumptions collide with.
+  static const uint8_t SANITY_MAC[6]        = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t SENDER_MAC[6]        = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01};
+  static const uint8_t SAMEEPOCH_MAC[6]     = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x02};
+  static const uint8_t FAULT_WATERMARK_MAC[6] = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x04};
 
-  printf("=== R5-01: replay recovery must not reopen a retired epoch ===\n");
+  printf("=== R5-01: replay recovery must not reopen a closed replay window ===\n");
 
   // Sanity: envelope sign/verify round-trips before we rely on it below.
   {
-    crypto_init();
+    CHECK(crypto_init(), "sanity: crypto_init() succeeds with healthy NVS");
     uint8_t frame[32];
     int len = sign_test_frame(frame, 1, 0, SANITY_MAC);
     int vlen = crypto_verify(SANITY_MAC, frame, len);
     CHECK(vlen == 1, "sanity: a validly-signed first frame is accepted");
   }
 
-  // ---- Attack sequence -----------------------------------------------
+  // ---- Attack sequence: retired-epoch replay (original R5-01 finding) --
   // Simulate the sender progressing through epochs A..F (six boots),
   // each separated by more than the epoch-silence period. This exceeds
   // the old design's 4-entry retired ring by two full generations.
   host_mock_time_us = 0;
-  crypto_init();
+  CHECK(crypto_init(), "attack sequence: crypto_init() succeeds");
 
   uint32_t epoch_A = 0;
   uint8_t frame_A[32];
@@ -160,7 +173,7 @@ int main(void) {
   // brownout, watchdog reset, OTA reboot -- all routine). This is the
   // adversarial ordering: the attacker's captured frame is presented
   // BEFORE any fresh legitimate frame re-establishes the floor.
-  crypto_init(); // receiver "reboots"
+  CHECK(crypto_init(), "receiver reboot: crypto_init() succeeds"); // receiver "reboots"
   {
     int vlen = crypto_verify(SENDER_MAC, frame_A, frame_A_len);
     CHECK(vlen == 0,
@@ -175,8 +188,10 @@ int main(void) {
     int vlen = crypto_verify(SENDER_MAC, frame, len);
     CHECK(vlen == 1, "receiver reboot: a genuinely fresh, higher epoch is still accepted");
   }
-  // And a SECOND receiver reboot must persist that advanced floor too.
-  crypto_init();
+  // And a SECOND and THIRD receiver reboot must persist that advanced
+  // floor too -- and, per the pattern above, the attacker's frame is
+  // presented first each time, not just on the first reboot.
+  CHECK(crypto_init(), "second receiver reboot: crypto_init() succeeds");
   {
     uint32_t epoch_between = 50; // > A(1), but < 100 -- still retired relative to the new floor
     uint8_t frame[32];
@@ -186,16 +201,139 @@ int main(void) {
           "second receiver reboot: floor keeps advancing correctly, "
           "an epoch below the latest persisted floor is still rejected");
   }
+  CHECK(crypto_init(), "third receiver reboot: crypto_init() succeeds");
+  {
+    int vlen = crypto_verify(SENDER_MAC, frame_A, frame_A_len);
+    CHECK(vlen == 0,
+          "third receiver reboot: original captured epoch-A frame, presented "
+          "first again, is still rejected");
+  }
+
+  // ---- Same-epoch replay across a receiver reboot (verification-memo ---
+  // ---- finding, the core bug this round closes) ------------------------
+  CHECK(crypto_init(), "same-epoch scenario: crypto_init() succeeds");
+  uint8_t frame_seq50[32];
+  int frame_seq50_len = 0;
+  {
+    host_mock_time_us += SILENCE;
+    uint8_t frame[32];
+    int len = sign_test_frame(frame, 20, 50, SAMEEPOCH_MAC);
+    int vlen = crypto_verify(SAMEEPOCH_MAC, frame, len);
+    CHECK(vlen == 1, "same-epoch: (epoch=20, seq=50) accepted as the sender's first frame");
+    frame_seq50_len = sign_test_frame(frame_seq50, 20, 50, SAMEEPOCH_MAC);
+  }
+  CHECK(crypto_init(), "same-epoch: receiver reboot succeeds (sender stays at epoch 20)");
+  {
+    int vlen = crypto_verify(SAMEEPOCH_MAC, frame_seq50, frame_seq50_len);
+    CHECK(vlen == 0,
+          "same-epoch: captured (epoch=20, seq=50) frame is REJECTED as the very "
+          "first frame processed after reboot -- the exact verification-memo repro");
+  }
+  {
+    // Boundary: seq=51 is inside the reserved window (accepted_through was
+    // set to 50+CRYPTO_SEQ_WINDOW when seq=50 was first accepted), so it's
+    // also rejected -- the documented, bounded post-reboot tradeoff, not a
+    // separate bug. A genuinely fresh frame just past the watermark (below)
+    // proves this doesn't block the sender forever.
+    uint8_t frame[32];
+    int len = sign_test_frame(frame, 20, 51, SAMEEPOCH_MAC);
+    int vlen = crypto_verify(SAMEEPOCH_MAC, frame, len);
+    CHECK(vlen == 0,
+          "same-epoch: seq=51 (inside the reserved window) is also rejected post-reboot "
+          "-- expected, bounded tradeoff, not unbounded denial of service");
+  }
+  {
+    // Liveness: a seq beyond the persisted watermark (50 + CRYPTO_SEQ_WINDOW)
+    // must be accepted -- the live sender isn't permanently locked out.
+    uint32_t seq_beyond = 50 + CRYPTO_SEQ_WINDOW + 5;
+    uint8_t frame[32];
+    int len = sign_test_frame(frame, 20, seq_beyond, SAMEEPOCH_MAC);
+    int vlen = crypto_verify(SAMEEPOCH_MAC, frame, len);
+    CHECK(vlen == 1,
+          "same-epoch: seq beyond the reserved window is accepted -- liveness preserved");
+    // And THAT accepted seq, replayed again, must be rejected (ordinary
+    // same-session replay, now also durably watermarked since accepting it
+    // triggered a fresh persist).
+    int vlen2 = crypto_verify(SAMEEPOCH_MAC, frame, len);
+    CHECK(vlen2 == 0,
+          "same-epoch: the just-accepted seq is rejected on replay");
+  }
+
+  // ---- Persistence-failure fault injection: epoch-counter allocation ---
+  {
+    uint32_t before_fault;
+    CHECK(crypto_next_persistent_epoch(&before_fault),
+          "fault injection (epoch): baseline allocation succeeds");
+
+    host_nvs_fault_reset();
+    host_nvs_fault.nvs_open_n = -1;
+    strncpy(host_nvs_fault.only_ns, "crypto_ep", sizeof(host_nvs_fault.only_ns) - 1);
+
+    uint32_t during_fault = 0xDEADBEEF; // sentinel: must stay unwritten on failure
+    bool ok_epoch = crypto_next_persistent_epoch(&during_fault);
+    CHECK(!ok_epoch, "fault injection (epoch): allocation fails closed when the "
+                     "epoch-counter NVS namespace can't be opened (no random-epoch fallback)");
+    CHECK(during_fault == 0xDEADBEEF,
+          "fault injection (epoch): out-param is left untouched on failure, not "
+          "silently filled with a random/garbage value");
+
+    bool ok_init = crypto_init();
+    CHECK(!ok_init, "fault injection (epoch): crypto_init() itself also fails closed "
+                    "under the same fault (no random-epoch fallback anywhere in the init path)");
+
+    host_nvs_fault_reset();
+    // Recovery: a subsequent healthy allocation must be strictly greater
+    // than the pre-fault baseline -- proving the counter kept advancing
+    // monotonically (or at least never went backward/random) through the
+    // failure, not that it silently reset or was replaced by esp_random().
+    uint32_t after_fault;
+    CHECK(crypto_next_persistent_epoch(&after_fault),
+          "fault injection (epoch): allocation recovers once NVS is healthy again");
+    CHECK(after_fault > before_fault,
+          "fault injection (epoch): post-recovery epoch is strictly greater than the "
+          "pre-fault baseline -- monotonicity held through the failure");
+  }
+
+  // ---- Persistence-failure fault injection: mid-session watermark ------
+  // ---- advance must fail closed, not accept-then-fail-silently ---------
+  {
+    host_nvs_fault_reset();
+    CHECK(crypto_init(), "fault injection (watermark): crypto_init() succeeds");
+    uint8_t frame[32];
+    int len = sign_test_frame(frame, 5, 0, FAULT_WATERMARK_MAC);
+    int vlen = crypto_verify(FAULT_WATERMARK_MAC, frame, len);
+    CHECK(vlen == 1, "fault injection (watermark): first frame (seq=0) establishes the floor");
+
+    // Force the seq to cross the persisted watermark (0 + CRYPTO_SEQ_WINDOW)
+    // while NVS blob writes are failing.
+    host_nvs_fault.nvs_set_blob_n = 1;
+    strncpy(host_nvs_fault.only_ns, "crypto_floor", sizeof(host_nvs_fault.only_ns) - 1);
+    uint32_t seq_crossing = CRYPTO_SEQ_WINDOW + 1;
+    uint8_t frame2[32];
+    int len2 = sign_test_frame(frame2, 5, seq_crossing, FAULT_WATERMARK_MAC);
+    int vlen2 = crypto_verify(FAULT_WATERMARK_MAC, frame2, len2);
+    CHECK(vlen2 == 0,
+          "fault injection (watermark): frame crossing the watermark is REJECTED "
+          "when the persist fails -- not accepted on RAM-only state");
+
+    host_nvs_fault_reset();
+    int vlen3 = crypto_verify(FAULT_WATERMARK_MAC, frame2, len2);
+    CHECK(vlen3 == 1,
+          "fault injection (watermark): the identical frame is accepted once NVS "
+          "recovers -- proving the earlier rejection didn't corrupt RAM state");
+  }
 
   // ---- Persistent monotonic epoch survives a sender reboot -------------
   // This is the actual R5-01 fix: crypto_next_persistent_epoch() must
-  // never hand out the same or a lower value across repeated calls,
-  // because it's backed by the (persistent, NVS-style) boot counter, not
-  // esp_random().
+  // never hand out the same or a lower value across repeated boots,
+  // because it's backed by a persistent (NVS-style) boot counter, not
+  // esp_random() -- and must fail (not fall back to random) if it can't be
+  // durably allocated.
   {
-    uint32_t e1 = crypto_next_persistent_epoch();
-    uint32_t e2 = crypto_next_persistent_epoch();
-    uint32_t e3 = crypto_next_persistent_epoch();
+    uint32_t e1, e2, e3;
+    CHECK(crypto_next_persistent_epoch(&e1), "epoch alloc 1 succeeds");
+    CHECK(crypto_next_persistent_epoch(&e2), "epoch alloc 2 succeeds");
+    CHECK(crypto_next_persistent_epoch(&e3), "epoch alloc 3 succeeds");
     CHECK(e2 > e1 && e3 > e2,
           "crypto_next_persistent_epoch() is strictly increasing across repeated boots");
   }

@@ -184,6 +184,166 @@ int main(void) {
           "scenario E: recovery re-derives the correct (already-committed) counter, doesn't double-apply or corrupt it");
   }
 
+  // ---- Scenario F: the core verification-memo bug -- recovery's own -----
+  // ---- counter-commit write fails. The journal must NOT be cleared. -----
+  {
+    fresh_device(SUBTYPE_OTA_0);
+    _otav_manifest.valid = true;
+    _otav_manifest.sec_counter = 40;
+    CHECK(ota_verify_stage_counter(&OTA_1_PART), "scenario F: staging succeeds");
+    host_mock_running_partition.subtype = SUBTYPE_OTA_1; // target genuinely activated
+
+    host_nvs_fault_reset();
+    host_nvs_fault.nvs_set_u32_n = 1;
+    strncpy(host_nvs_fault.only_ns, "ota_sec", sizeof(host_nvs_fault.only_ns) - 1);
+    strncpy(host_nvs_fault.only_key, "sec_ctr", sizeof(host_nvs_fault.only_key) - 1);
+    reboot(); // recovery's sec_ctr commit fails
+
+    CHECK(ota_verify_get_counter() == 0,
+          "scenario F: counter is NOT burned when recovery's own commit fails");
+    CHECK(ota_verify_recovery_blocked(),
+          "scenario F: further OTA acceptance is blocked after a failed recovery commit");
+    uint8_t phase = 0xFF;
+    uint32_t ctr = 0;
+    uint8_t part = 0;
+    CHECK(nvs_get_u8(_otav_nvs, "pend_phase", &phase) == ESP_OK && phase == OTA_JOURNAL_PHASE_STAGED,
+          "scenario F: journal phase is still intact (NOT cleared) after the failed commit");
+    CHECK(nvs_get_u32(_otav_nvs, "pend_ctr", &ctr) == ESP_OK && ctr == 40,
+          "scenario F: journal pending counter is still intact");
+    CHECK(nvs_get_u8(_otav_nvs, "pend_part", &part) == ESP_OK && part == SUBTYPE_OTA_1,
+          "scenario F: journal target partition is still intact");
+
+    host_nvs_fault_reset();
+    reboot(); // retry with NVS healthy again
+    CHECK(ota_verify_get_counter() == 40,
+          "scenario F: retry on a later boot converges (counter now committed)");
+    CHECK(!ota_verify_recovery_blocked(),
+          "scenario F: OTA acceptance is unblocked once recovery converges");
+    esp_err_t e = nvs_get_u8(_otav_nvs, "pend_phase", &phase);
+    CHECK(e != ESP_OK || phase == OTA_JOURNAL_PHASE_NONE,
+          "scenario F: journal is cleared once recovery actually converges");
+  }
+
+  // ---- Scenario G: pend_ctr / pend_part read failures during recovery --
+  {
+    // G1: pend_ctr read fails.
+    fresh_device(SUBTYPE_OTA_0);
+    _otav_manifest.valid = true;
+    _otav_manifest.sec_counter = 41;
+    CHECK(ota_verify_stage_counter(&OTA_1_PART), "scenario G1: staging succeeds");
+
+    host_nvs_fault_reset();
+    host_nvs_fault.nvs_get_u32_n = 1;
+    strncpy(host_nvs_fault.only_ns, "ota_sec", sizeof(host_nvs_fault.only_ns) - 1);
+    strncpy(host_nvs_fault.only_key, "pend_ctr", sizeof(host_nvs_fault.only_key) - 1);
+    reboot();
+
+    CHECK(ota_verify_get_counter() == 0, "scenario G1: no counter burn on an unreadable pend_ctr");
+    CHECK(ota_verify_recovery_blocked(), "scenario G1: recovery is blocked, not guessing");
+    uint8_t phase = 0xFF;
+    CHECK(nvs_get_u8(_otav_nvs, "pend_phase", &phase) == ESP_OK && phase == OTA_JOURNAL_PHASE_STAGED,
+          "scenario G1: journal is untouched, not cleared");
+
+    host_nvs_fault_reset();
+    host_mock_running_partition.subtype = SUBTYPE_OTA_1; // target activated, for a clean retry
+    reboot();
+    CHECK(ota_verify_get_counter() == 41, "scenario G1: retry converges once the read succeeds");
+    CHECK(!ota_verify_recovery_blocked(), "scenario G1: unblocked after convergence");
+
+    // G2: pend_part read fails (same shape, different field).
+    fresh_device(SUBTYPE_OTA_0);
+    _otav_manifest.valid = true;
+    _otav_manifest.sec_counter = 42;
+    CHECK(ota_verify_stage_counter(&OTA_1_PART), "scenario G2: staging succeeds");
+
+    host_nvs_fault_reset();
+    host_nvs_fault.nvs_get_u32_n = 1; // nvs_get_u8 delegates through nvs_get_u32
+    strncpy(host_nvs_fault.only_ns, "ota_sec", sizeof(host_nvs_fault.only_ns) - 1);
+    strncpy(host_nvs_fault.only_key, "pend_part", sizeof(host_nvs_fault.only_key) - 1);
+    reboot();
+
+    CHECK(ota_verify_get_counter() == 0, "scenario G2: no counter burn on an unreadable pend_part");
+    CHECK(ota_verify_recovery_blocked(), "scenario G2: recovery is blocked, not guessing");
+
+    host_nvs_fault_reset();
+    host_mock_running_partition.subtype = SUBTYPE_OTA_1;
+    reboot();
+    CHECK(ota_verify_get_counter() == 42, "scenario G2: retry converges once the read succeeds");
+    CHECK(!ota_verify_recovery_blocked(), "scenario G2: unblocked after convergence");
+  }
+
+  // ---- Scenario H: a genuinely missing key (not fault-injected), with --
+  // ---- phase == STAGED still present -- the distinct ESP_ERR_NVS_NOT_FOUND
+  // ---- path, not just a generic injected failure. ----------------------
+  {
+    fresh_device(SUBTYPE_OTA_0);
+    _otav_manifest.valid = true;
+    _otav_manifest.sec_counter = 43;
+    CHECK(ota_verify_stage_counter(&OTA_1_PART), "scenario H: staging succeeds");
+    esp_err_t erased = nvs_erase_key(_otav_nvs, "pend_ctr"); // genuinely gone, no fault injection
+    CHECK(erased == ESP_OK, "scenario H: pend_ctr genuinely erased (test setup)");
+
+    reboot();
+    CHECK(ota_verify_get_counter() == 0, "scenario H: no counter burn on a genuinely missing pend_ctr");
+    CHECK(ota_verify_recovery_blocked(), "scenario H: recovery is blocked, not guessing");
+    uint8_t phase = 0xFF;
+    CHECK(nvs_get_u8(_otav_nvs, "pend_phase", &phase) == ESP_OK && phase == OTA_JOURNAL_PHASE_STAGED,
+          "scenario H: journal phase is left intact even though pend_ctr is genuinely gone");
+  }
+
+  // ---- Scenario I: journal-cleanup failures converge correctly on both -
+  // ---- the abandon path and the commit-success path -- and only the ----
+  // ---- commit-success path is explicitly NOT blocked (self-heals). -----
+  {
+    // I1: abandon path.
+    fresh_device(SUBTYPE_OTA_0);
+    _otav_manifest.valid = true;
+    _otav_manifest.sec_counter = 50;
+    CHECK(ota_verify_stage_counter(&OTA_1_PART), "scenario I1: staging succeeds");
+
+    host_nvs_fault_reset();
+    host_nvs_fault.nvs_erase_key_n = -1; // sticky: every erase fails
+    strncpy(host_nvs_fault.only_ns, "ota_sec", sizeof(host_nvs_fault.only_ns) - 1);
+    CHECK(!ota_verify_abandon_stage(), "scenario I1: abandon reports cleanup failure");
+    uint8_t phase = 0xFF;
+    CHECK(nvs_get_u8(_otav_nvs, "pend_phase", &phase) == ESP_OK && phase == OTA_JOURNAL_PHASE_STAGED,
+          "scenario I1: journal is left dangling immediately after the failed cleanup");
+
+    host_nvs_fault_reset();
+    reboot(); // running partition still OTA_0 -- never activated
+    CHECK(ota_verify_get_counter() == 0, "scenario I1: counter still untouched after convergence");
+    CHECK(!ota_verify_recovery_blocked(),
+          "scenario I1: abandon-path cleanup failure never blocks recovery (self-healing)");
+    esp_err_t e1 = nvs_get_u8(_otav_nvs, "pend_phase", &phase);
+    CHECK(e1 != ESP_OK || phase == OTA_JOURNAL_PHASE_NONE,
+          "scenario I1: journal converges (clears) once cleanup succeeds again");
+
+    // I2: commit-success path.
+    fresh_device(SUBTYPE_OTA_0);
+    _otav_manifest.valid = true;
+    _otav_manifest.sec_counter = 51;
+    CHECK(ota_verify_stage_counter(&OTA_1_PART), "scenario I2: staging succeeds");
+    host_mock_running_partition.subtype = SUBTYPE_OTA_1;
+
+    host_nvs_fault_reset();
+    host_nvs_fault.nvs_erase_key_n = -1;
+    strncpy(host_nvs_fault.only_ns, "ota_sec", sizeof(host_nvs_fault.only_ns) - 1);
+    CHECK(ota_verify_commit_counter(),
+          "scenario I2: commit itself still succeeds even though cleanup will fail");
+    CHECK(ota_verify_get_counter() == 51, "scenario I2: counter is committed immediately");
+    CHECK(nvs_get_u8(_otav_nvs, "pend_phase", &phase) == ESP_OK && phase == OTA_JOURNAL_PHASE_STAGED,
+          "scenario I2: journal is left dangling immediately after the failed cleanup");
+
+    host_nvs_fault_reset();
+    reboot();
+    CHECK(ota_verify_get_counter() == 51, "scenario I2: counter is unchanged (already correct) after convergence");
+    CHECK(!ota_verify_recovery_blocked(),
+          "scenario I2: commit-success path was never blocked, unlike scenario F's recovery-commit failure");
+    esp_err_t e2 = nvs_get_u8(_otav_nvs, "pend_phase", &phase);
+    CHECK(e2 != ESP_OK || phase == OTA_JOURNAL_PHASE_NONE,
+          "scenario I2: journal converges (clears) once cleanup succeeds again");
+  }
+
   if (g_failures) {
     printf("\n%d check(s) FAILED\n", g_failures);
     return 1;
