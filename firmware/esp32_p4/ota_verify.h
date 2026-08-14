@@ -94,11 +94,24 @@ static bool _otav_sha_active = false;
 #define OTA_JOURNAL_PHASE_NONE   0
 #define OTA_JOURNAL_PHASE_STAGED 1
 
-// R5-03: erase the journal keys and check every result. Used both to
-// finish a successful commit and to abandon a staged-but-never-activated
+// R5-03 (verification-memo hardening): set whenever a boot's recovery
+// attempt observes durable state it can't safely resolve -- a counter
+// commit failed, or the pending record was unreadable/incomplete. Cleared
+// only by a LATER boot's recovery actually converging (see
+// _ota_verify_recover() below); never cleared any other way.
+// ota_verify_manifest() refuses to accept new manifests while this is set,
+// which transitively blocks the whole OTA pipeline (staging, committing)
+// since every later step requires a valid manifest first.
+static bool _otav_recovery_blocked = false;
+
+static bool ota_verify_recovery_blocked() { return _otav_recovery_blocked; }
+
+// R5-03: erase the journal keys and check every result, returning success
+// so callers can react to a cleanup failure. Used both to finish a
+// successful commit and to abandon a staged-but-never-activated
 // transaction (either right after esp_ota_set_boot_partition fails, or
 // during boot recovery).
-static void _ota_verify_clear_journal(const char *ctx) {
+static bool _ota_verify_clear_journal(const char *ctx) {
   esp_err_t e1 = nvs_erase_key(_otav_nvs, "pend_phase");
   esp_err_t e2 = nvs_erase_key(_otav_nvs, "pend_ctr");
   esp_err_t e3 = nvs_erase_key(_otav_nvs, "pend_part");
@@ -111,21 +124,35 @@ static void _ota_verify_clear_journal(const char *ctx) {
     Serial.printf("[ota-verify] WARNING: journal cleanup (%s) failed "
                   "(erase=%d/%d/%d commit=%d) -- stale keys may remain\n",
                   ctx, e1, e2, e3, e4);
+  return ok;
 }
 
 // R5-03: abandon a staged-but-not-yet-activated transaction immediately
 // (e.g. esp_ota_set_boot_partition just failed) rather than waiting for a
 // reboot for recovery to figure it out. The counter is left untouched so
 // the same manifest can be retried.
-static void ota_verify_abandon_stage() {
-  _ota_verify_clear_journal("abandon");
+static bool ota_verify_abandon_stage() {
+  return _ota_verify_clear_journal("abandon");
 }
 
 // R4-03/R5-03: recover from a power loss during a previous OTA commit.
 // Compares the journaled target partition against the partition that
 // actually booted -- ground truth, not assumed intent -- to decide
 // whether the update took effect.
+//
+// R5-03 (verification-memo hardening): the original version of this
+// function unconditionally cleared the journal even when the recovery
+// commit itself failed, destroying the only durable record of the pending
+// transaction while leaving sec_ctr possibly stale -- a real anti-rollback
+// consistency gap (a stale, too-low sec_ctr could let a captured
+// lower-numbered signed manifest later pass the anti-rollback check, or
+// needlessly block a legitimate retry). Fixed: every read this function
+// depends on is now checked, and journal-destroying cleanup is skipped
+// entirely whenever the record can't be fully and safely resolved --
+// leaving it intact for an identical retry on the next boot instead.
 static void _ota_verify_recover() {
+  _otav_recovery_blocked = false;  // this boot's own outcome decides the flag
+
   uint8_t phase = OTA_JOURNAL_PHASE_NONE;
   if (nvs_get_u8(_otav_nvs, "pend_phase", &phase) != ESP_OK ||
       phase == OTA_JOURNAL_PHASE_NONE)
@@ -133,8 +160,17 @@ static void _ota_verify_recover() {
 
   uint32_t pend_ctr = 0;
   uint8_t pend_subtype = 0xFF;
-  nvs_get_u32(_otav_nvs, "pend_ctr", &pend_ctr);
-  nvs_get_u8(_otav_nvs, "pend_part", &pend_subtype);
+  esp_err_t e_ctr = nvs_get_u32(_otav_nvs, "pend_ctr", &pend_ctr);
+  esp_err_t e_part = nvs_get_u8(_otav_nvs, "pend_part", &pend_subtype);
+  if (e_ctr != ESP_OK || e_part != ESP_OK) {
+    // phase says STAGED but the record is incomplete/unreadable. Do not
+    // guess: no counter burn, no journal clear, no activation decision.
+    // Leave everything exactly as found for a retry on the next boot.
+    Serial.printf("[ota-verify] CRITICAL: journal read incomplete (ctr=%d part=%d) "
+                  "-- deferring recovery decision to next boot\n", e_ctr, e_part);
+    _otav_recovery_blocked = true;
+    return;
+  }
 
   const esp_partition_t *running = esp_ota_get_running_partition();
   bool activated = running != NULL && running->subtype == pend_subtype;
@@ -145,18 +181,31 @@ static void _ota_verify_recover() {
     // committing the counter (this also covers a crash between
     // esp_ota_set_boot_partition succeeding and the final commit).
     uint32_t current = 0;
-    nvs_get_u32(_otav_nvs, "sec_ctr", &current);
+    esp_err_t e_cur = nvs_get_u32(_otav_nvs, "sec_ctr", &current);
+    if (e_cur != ESP_OK && e_cur != ESP_ERR_NVS_NOT_FOUND) {
+      // Can't safely compare pend_ctr against an unknown current value --
+      // a silently-defaulted current=0 risks treating a rollback-unsafe
+      // comparison as safe. Same fail-safe treatment as the reads above.
+      Serial.printf("[ota-verify] CRITICAL: could not read current sec_ctr (err=%d) "
+                    "-- deferring recovery decision to next boot\n", e_cur);
+      _otav_recovery_blocked = true;
+      return;
+    }
     if (pend_ctr > current) {
       esp_err_t e1 = nvs_set_u32(_otav_nvs, "sec_ctr", pend_ctr);
       esp_err_t e2 = nvs_commit(_otav_nvs);
       if (e1 != ESP_OK || e2 != ESP_OK) {
+        // R5-03: THE core fix -- do not fall through to clear the journal.
+        // Leaving it intact means the exact same recovery decision is
+        // retried, and can succeed, on the next boot.
         Serial.printf("[ota-verify] CRITICAL: recovery counter commit failed "
-                      "(set=%d commit=%d) -- counter/partition state may be inconsistent\n",
-                      e1, e2);
-      } else {
-        Serial.printf("[ota-verify] recovered: activated partition confirmed, counter -> %u\n",
-                      pend_ctr);
+                      "(set=%d commit=%d) -- journal left intact for retry, "
+                      "blocking further OTA acceptance\n", e1, e2);
+        _otav_recovery_blocked = true;
+        return;
       }
+      Serial.printf("[ota-verify] recovered: activated partition confirmed, counter -> %u\n",
+                    pend_ctr);
     }
   } else {
     // The running partition does NOT match the journaled target: power
@@ -168,7 +217,14 @@ static void _ota_verify_recover() {
                    "(old partition still running) -- abandoning, counter left untouched");
   }
 
-  _ota_verify_clear_journal("recover");
+  if (!_ota_verify_clear_journal("recover")) {
+    // Same self-healing reasoning as ota_verify_commit_counter()'s cleanup
+    // failure below: sec_ctr (activated branch) is already durably
+    // correct, or (abandoned branch) untouched -- a stale pend_* record
+    // just re-triggers the same ground-truth check next boot. Not blocked.
+    Serial.println("[ota-verify] WARNING: journal cleanup after recovery failed "
+                   "-- will retry cleanup on next boot");
+  }
 }
 
 static bool ota_verify_init() {
@@ -197,6 +253,11 @@ static uint32_t ota_verify_get_counter() {
 
 static bool ota_verify_manifest(const uint8_t *data, int len) {
   if (!_otav_ready) return false;
+  if (_otav_recovery_blocked) {
+    Serial.println("[ota-verify] REJECTED: prior recovery attempt left durable "
+                   "state unconverged -- refusing new manifests until a clean boot recovers");
+    return false;
+  }
   if (len < (int)sizeof(OtaManifest)) {
     Serial.println("[ota-verify] manifest too short");
     return false;
@@ -302,14 +363,25 @@ static bool ota_verify_sha_finish() {
 // partition, so a power loss before the switch takes effect can be told
 // apart from one after, and the counter is never committed for an update
 // that never actually activated.
+//
+// R5-03 (verification-memo hardening): pend_phase -- the "this record is
+// complete" marker -- is written LAST, after pend_ctr and pend_part.
+// ESP-IDF's NVS has no cross-key transactions, so a crash between two
+// separate nvs_set_* calls is a real possibility; writing phase last means
+// a crash mid-stage leaves phase at its prior value (normally NONE, since
+// ota_verify_manifest() refuses to stage a new transaction while a prior
+// one is unrecovered) rather than STAGED pointing at a mix of new and
+// stale pend_ctr/pend_part from a previous transaction -- a case the
+// read-failure checks in _ota_verify_recover() alone wouldn't catch,
+// since those reads would succeed, just with the wrong generation's data.
 static bool ota_verify_stage_counter(const esp_partition_t *target) {
   if (!_otav_manifest.valid || !target) return false;
-  esp_err_t e1 = nvs_set_u8(_otav_nvs, "pend_phase", OTA_JOURNAL_PHASE_STAGED);
-  esp_err_t e2 = nvs_set_u32(_otav_nvs, "pend_ctr", _otav_manifest.sec_counter);
-  esp_err_t e3 = nvs_set_u8(_otav_nvs, "pend_part", target->subtype);
+  esp_err_t e1 = nvs_set_u32(_otav_nvs, "pend_ctr", _otav_manifest.sec_counter);
+  esp_err_t e2 = nvs_set_u8(_otav_nvs, "pend_part", target->subtype);
+  esp_err_t e3 = nvs_set_u8(_otav_nvs, "pend_phase", OTA_JOURNAL_PHASE_STAGED);
   esp_err_t e4 = nvs_commit(_otav_nvs);
   if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK || e4 != ESP_OK) {
-    Serial.printf("[ota-verify] stage transaction failed: phase=%d ctr=%d part=%d commit=%d\n",
+    Serial.printf("[ota-verify] stage transaction failed: ctr=%d part=%d phase=%d commit=%d\n",
                   e1, e2, e3, e4);
     return false;
   }
@@ -330,8 +402,11 @@ static bool ota_verify_commit_counter() {
   // If cleanup below fails, the counter is already correctly committed to
   // match the partition that is about to boot, so the leftover journal is
   // merely stale: next boot's recovery will see running == pend_part,
-  // re-commit the same (already-correct) counter, and clear it then.
-  _ota_verify_clear_journal("commit");
+  // re-commit the same (already-correct) counter, and clear it then. This
+  // path is deliberately NOT treated as _otav_recovery_blocked -- unlike a
+  // failed recovery commit, sec_ctr here is already correct.
+  if (!_ota_verify_clear_journal("commit"))
+    Serial.println("[ota-verify] WARNING: journal cleanup after commit failed (non-fatal, self-healing)");
   Serial.printf("[ota-verify] counter updated to %u\n", _otav_manifest.sec_counter);
   return true;
 }

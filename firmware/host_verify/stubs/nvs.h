@@ -41,8 +41,47 @@ struct host_nvs_ns {
 };
 static struct host_nvs_ns host_nvs_store[HOST_NVS_MAX_NS];
 
+// ---- Test-only fault injection --------------------------------------------
+// Lets behavioral tests simulate NVS/flash failures at precise points, to
+// verify fail-closed behavior (R5-01/R5-03 verification-memo hardening) --
+// something that couldn't be tested at all before this existed, since the
+// stub previously always succeeded. Each counter: 0 = never fail (default),
+// N>0 = fail exactly the next N matching calls then stop failing, -1 = fail
+// every matching call until reset (sticky). only_ns/only_key restrict which
+// calls match; an empty string matches anything.
+struct host_nvs_fault {
+  int nvs_open_n;
+  int nvs_set_u32_n;   // also covers nvs_set_u8 (implemented via set_u32)
+  int nvs_set_blob_n;
+  int nvs_commit_n;
+  int nvs_erase_key_n;
+  int nvs_get_u32_n;   // also covers nvs_get_u8
+  int nvs_get_blob_n;
+  char only_ns[32];
+  char only_key[32];
+};
+static struct host_nvs_fault host_nvs_fault;
+
+static inline int _host_nvs_fault_match(const char *ns, const char *key) {
+  if (host_nvs_fault.only_ns[0] && (!ns || strcmp(host_nvs_fault.only_ns, ns) != 0)) return 0;
+  if (host_nvs_fault.only_key[0] && (!key || strcmp(host_nvs_fault.only_key, key) != 0)) return 0;
+  return 1;
+}
+static inline int _host_nvs_fault_consume(int *counter, const char *ns, const char *key) {
+  if (*counter == 0 || !_host_nvs_fault_match(ns, key)) return 0;
+  if (*counter > 0) (*counter)--;
+  return 1;
+}
+// Test-only helper: clear all fault-injection state (independent of
+// host_nvs_wipe() below -- tests reset each explicitly, since "wipe the
+// data" and "stop injecting faults" are orthogonal concerns).
+static inline void host_nvs_fault_reset(void) {
+  memset(&host_nvs_fault, 0, sizeof(host_nvs_fault));
+}
+
 static inline esp_err_t nvs_open(const char *name, nvs_open_mode_t mode, nvs_handle_t *out) {
   (void)mode;
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_open_n, name, NULL)) return ESP_FAIL;
   for (int i = 0; i < HOST_NVS_MAX_NS; i++) {
     if (host_nvs_store[i].used && strcmp(host_nvs_store[i].name, name) == 0) {
       *out = (nvs_handle_t)(i + 1);
@@ -62,6 +101,7 @@ static inline esp_err_t nvs_open(const char *name, nvs_open_mode_t mode, nvs_han
 
 static inline esp_err_t nvs_get_u32(nvs_handle_t h, const char *key, uint32_t *out) {
   struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_get_u32_n, ns->name, key)) return ESP_FAIL;
   for (int i = 0; i < HOST_NVS_MAX_KEYS; i++) {
     if (ns->kv[i].used && strcmp(ns->kv[i].key, key) == 0) {
       *out = ns->kv[i].value;
@@ -80,6 +120,7 @@ static inline esp_err_t nvs_get_u8(nvs_handle_t h, const char *key, uint8_t *out
 
 static inline esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t value) {
   struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_set_u32_n, ns->name, key)) return ESP_FAIL;
   for (int i = 0; i < HOST_NVS_MAX_KEYS; i++) {
     if (ns->kv[i].used && strcmp(ns->kv[i].key, key) == 0) {
       ns->kv[i].value = value;
@@ -103,6 +144,7 @@ static inline esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t valu
 
 static inline esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *out, size_t *len) {
   struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_get_blob_n, ns->name, key)) return ESP_FAIL;
   for (int i = 0; i < HOST_NVS_MAX_BLOB_KEYS; i++) {
     if (ns->blob[i].used && strcmp(ns->blob[i].key, key) == 0) {
       size_t n = ns->blob[i].len < *len ? ns->blob[i].len : *len;
@@ -117,6 +159,7 @@ static inline esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *out,
 static inline esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *value, size_t len) {
   if (len > HOST_NVS_MAX_BLOB_LEN) return ESP_FAIL;
   struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_set_blob_n, ns->name, key)) return ESP_FAIL;
   for (int i = 0; i < HOST_NVS_MAX_BLOB_KEYS; i++) {
     if (ns->blob[i].used && strcmp(ns->blob[i].key, key) == 0) {
       memcpy(ns->blob[i].data, value, len);
@@ -138,6 +181,7 @@ static inline esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void
 
 static inline esp_err_t nvs_erase_key(nvs_handle_t h, const char *key) {
   struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_erase_key_n, ns->name, key)) return ESP_FAIL;
   for (int i = 0; i < HOST_NVS_MAX_KEYS; i++) {
     if (ns->kv[i].used && strcmp(ns->kv[i].key, key) == 0) {
       ns->kv[i].used = 0;
@@ -147,10 +191,17 @@ static inline esp_err_t nvs_erase_key(nvs_handle_t h, const char *key) {
   return ESP_ERR_NVS_NOT_FOUND;
 }
 
-static inline esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+static inline esp_err_t nvs_commit(nvs_handle_t h) {
+  struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  if (_host_nvs_fault_consume(&host_nvs_fault.nvs_commit_n, ns->name, NULL)) return ESP_FAIL;
+  return ESP_OK;
+}
 static inline void nvs_close(nvs_handle_t h) { (void)h; }
 
 // Test-only helper: wipe the whole store to simulate a factory-erased flash.
+// Does NOT reset fault-injection state (host_nvs_fault_reset() above) --
+// "wipe the data" and "stop injecting faults" are orthogonal concerns, and
+// tests must reset each explicitly.
 static inline void host_nvs_wipe(void) {
   memset(host_nvs_store, 0, sizeof(host_nvs_store));
 }

@@ -76,29 +76,61 @@ static uint32_t _crypto_tx_seq = 0;
 // closed for unknown MACs below), so an attacker without the PSK cannot
 // trigger it.
 #define CRYPTO_SLOT_STALE_US       60000000  // 60s stale threshold for slot eviction
+// R5-01 (verification-memo hardening): size of the sequence range reserved
+// (persisted) ahead of the live seq counter -- see the durable watermark
+// design note above _crypto_persist_epoch_floor_candidate() below. Tunable:
+// larger bounds fewer NVS writes at the cost of a bigger post-reboot
+// legitimate-frame-rejection window; smaller does the reverse.
+#define CRYPTO_SEQ_WINDOW 256
 static struct {
   uint8_t mac[6];
   uint32_t epoch;
   uint32_t last_seq;
+  // R5-01: durable seq watermark -- see below. Any seq <= this value is
+  // guaranteed rejected even as the very first frame processed after a
+  // receiver reboot, because it's what last_seq is restored to on load.
+  uint32_t accepted_through;
   int64_t last_seen_us;
   bool active;
 } _crypto_replay[CRYPTO_REPLAY_SLOTS];
 
-// R5-01 (post-review hardening): the epoch floor recorded in
-// _crypto_replay[] above lives in RAM and is wiped by crypto_init() on
-// every boot. A persistent, NVS-backed sender epoch alone isn't enough --
-// without also remembering each sender's floor across a *receiver* reboot,
-// a captured old-epoch frame arriving first after the receiver restarts is
-// accepted as a fresh "first sighting", reopening the exact replay window
-// the monotonic epoch was meant to close permanently. Only mac+epoch are
-// persisted (not seq/timestamps): epoch transitions happen once per remote
-// sender boot, not per packet, so this write is rare and doesn't wear the
-// flash the way a per-packet write would.
+// R5-01 (verification-memo hardening): a receiver-reboot replay bypass was
+// found in the previous fix. That fix persisted each sender's epoch floor
+// (mac+epoch) so a RETIRED epoch stays rejected forever across a reboot --
+// but last_seq was never persisted (reset to 0 on every boot), so a
+// captured frame from the sender's CURRENT, still-valid epoch with any
+// seq > 0 was accepted again immediately after a reboot: seq > last_seq(0)
+// trivially passes. Fix: persist a durable seq WATERMARK ("accepted_through")
+// per slot, advanced in reserved chunks of CRYPTO_SEQ_WINDOW ahead of the
+// live seq rather than on every packet (bounds flash writes to roughly one
+// per CRYPTO_SEQ_WINDOW frames instead of one per frame), and restore
+// last_seq from that watermark on load -- not from 0. Cost: a legitimate
+// frame with seq in (actual last-accepted seq before the crash,
+// accepted_through] is also rejected right after a reboot, until the live
+// sender's seq naturally advances past the persisted watermark. That's a
+// bounded, accepted availability tradeoff, not a security gap.
+//
+// The watermark must be persisted BEFORE a frame that requires advancing
+// it is accepted, and the frame must be REJECTED if that persist fails --
+// accepting on RAM-only state (as the previous _crypto_persist_epoch_floors()
+// did, logging but not gating on failure) means a crash right after would
+// have delivered a frame with no durable record of it, reopening the same
+// class of bug the watermark exists to close. Only mac+epoch+watermark are
+// persisted (not live seq/timestamps).
 typedef struct __attribute__((packed)) {
   uint8_t mac[6];
   uint32_t epoch;
+  uint32_t accepted_through;
   uint8_t active;
 } CryptoFloorEntry;
+
+// R5-01: bumped from "floors" -- the persisted record's layout changed
+// (added accepted_through). A fresh key makes the schema change explicit
+// instead of relying on the incidental struct-size check to catch it; a
+// device upgrading firmware loses its persisted floors once (falls back to
+// first-sighting semantics for previously-known senders), a one-time,
+// openly-declared tradeoff rather than a silent bug.
+#define CRYPTO_FLOOR_NVS_KEY "floors_v2"
 
 static nvs_handle_t _crypto_floor_nvs;
 static bool _crypto_floor_nvs_ready = false;
@@ -114,35 +146,63 @@ static void _crypto_load_epoch_floors() {
 
   CryptoFloorEntry buf[CRYPTO_REPLAY_SLOTS];
   size_t len = sizeof(buf);
-  if (nvs_get_blob(_crypto_floor_nvs, "floors", buf, &len) == ESP_OK &&
+  if (nvs_get_blob(_crypto_floor_nvs, CRYPTO_FLOOR_NVS_KEY, buf, &len) == ESP_OK &&
       len == sizeof(buf)) {
     for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
       if (buf[i].active) {
         memcpy(_crypto_replay[i].mac, buf[i].mac, 6);
         _crypto_replay[i].epoch = buf[i].epoch;
+        _crypto_replay[i].accepted_through = buf[i].accepted_through;
+        // R5-01: restore last_seq from the durable watermark, not 0, so a
+        // captured frame with seq <= accepted_through is rejected even as
+        // the very first frame processed after reboot.
+        _crypto_replay[i].last_seq = buf[i].accepted_through;
         _crypto_replay[i].active = true;
-        // last_seq/last_seen_us intentionally stay at 0 -- only the epoch
-        // floor needs to survive a reboot, not live sequence state.
       }
     }
   }
 }
 
-static void _crypto_persist_epoch_floors() {
-  if (!_crypto_floor_nvs_ready) return;
+// R5-01: persist the floors table with one slot's (mac, epoch,
+// accepted_through) substituted for a CANDIDATE value, built entirely from
+// current RAM state otherwise. Returns false -- and touches no RAM state
+// in the caller -- if the write fails, so callers can fail closed (reject
+// the frame) instead of accepting on state that never became durable.
+static bool _crypto_persist_epoch_floor_candidate(int cand_slot,
+                                                    const uint8_t *cand_mac,
+                                                    uint32_t cand_epoch,
+                                                    uint32_t cand_accepted_through) {
+  if (!_crypto_floor_nvs_ready) return false;
   CryptoFloorEntry buf[CRYPTO_REPLAY_SLOTS];
   memset(buf, 0, sizeof(buf));
   for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
-    if (_crypto_replay[i].active) {
+    if (i == cand_slot) {
+      memcpy(buf[i].mac, cand_mac, 6);
+      buf[i].epoch = cand_epoch;
+      buf[i].accepted_through = cand_accepted_through;
+      buf[i].active = 1;
+    } else if (_crypto_replay[i].active) {
       memcpy(buf[i].mac, _crypto_replay[i].mac, 6);
       buf[i].epoch = _crypto_replay[i].epoch;
+      buf[i].accepted_through = _crypto_replay[i].accepted_through;
       buf[i].active = 1;
     }
   }
-  esp_err_t e1 = nvs_set_blob(_crypto_floor_nvs, "floors", buf, sizeof(buf));
+  esp_err_t e1 = nvs_set_blob(_crypto_floor_nvs, CRYPTO_FLOOR_NVS_KEY, buf, sizeof(buf));
   esp_err_t e2 = nvs_commit(_crypto_floor_nvs);
-  if (e1 != ESP_OK || e2 != ESP_OK)
-    Serial.printf("[crypto] WARNING: failed to persist epoch floor (set=%d commit=%d)\n", e1, e2);
+  if (e1 != ESP_OK || e2 != ESP_OK) {
+    Serial.printf("[crypto] CRITICAL: failed to persist epoch/watermark floor "
+                  "(slot=%d set=%d commit=%d) -- rejecting frame (fail closed)\n",
+                  cand_slot, e1, e2);
+    return false;
+  }
+  return true;
+}
+
+// R5-01: given the seq that just triggered a watermark advance, compute
+// the new durable watermark, with explicit uint32 overflow protection.
+static uint32_t _crypto_next_watermark(uint32_t seq) {
+  return (seq > UINT32_MAX - CRYPTO_SEQ_WINDOW) ? UINT32_MAX : seq + CRYPTO_SEQ_WINDOW;
 }
 
 // R5-01: persistent monotonic epoch. A random per-boot epoch has no
@@ -150,34 +210,68 @@ static void _crypto_persist_epoch_floors() {
 // into a bounded "retired epoch" ring that had to evict entries (and thus
 // eventually re-admit them) to stay fail-closed. Loading a monotonically
 // increasing, NVS-persisted counter instead means an epoch that has been
-// superseded is invalid forever — comparison replaces bookkeeping. Falls
-// back to a random, non-monotonic value only if NVS is entirely
-// unavailable (logged, since it reopens the original weakness).
-static uint32_t crypto_next_persistent_epoch() {
+// superseded is invalid forever — comparison replaces bookkeeping.
+// R5-01 (verification-memo hardening): the random-epoch fallback on NVS
+// failure is REMOVED -- it silently reopened the exact non-monotonic-epoch
+// weakness this design exists to close. If a monotonic epoch can't be
+// durably allocated and committed, the caller must refuse to bring up
+// crypto/ESP-NOW rather than come up "healthy" with a forgeable epoch.
+// Also guards explicit uint32 overflow: an about-to-wrap counter is
+// treated as unrecoverable exhaustion, not silently wrapped (which would
+// violate monotonicity for the device's very next boot).
+static bool crypto_next_persistent_epoch(uint32_t *out_epoch) {
   nvs_handle_t h;
-  if (nvs_open("crypto_ep", NVS_READWRITE, &h) == ESP_OK) {
-    uint32_t epoch = 0;
-    nvs_get_u32(h, "boot_ctr", &epoch);
-    epoch++;
-    esp_err_t e1 = nvs_set_u32(h, "boot_ctr", epoch);
-    esp_err_t e2 = nvs_commit(h);
-    nvs_close(h);
-    if (e1 == ESP_OK && e2 == ESP_OK) return epoch;
+  if (nvs_open("crypto_ep", NVS_READWRITE, &h) != ESP_OK) {
+    Serial.println("[crypto] CRITICAL: persistent epoch counter NVS unavailable "
+                   "-- refusing to start (no non-monotonic fallback)");
+    return false;
   }
-  Serial.println("[crypto] WARNING: persistent epoch counter unavailable — "
-                 "falling back to a random, non-monotonic epoch");
-  return esp_random();
+  uint32_t epoch = 0;
+  nvs_get_u32(h, "boot_ctr", &epoch);  // NOT_FOUND on first-ever boot leaves epoch=0, fine
+  if (epoch == UINT32_MAX) {
+    Serial.println("[crypto] CRITICAL: persistent epoch counter exhausted "
+                   "(would wrap to 0) -- refusing to start");
+    nvs_close(h);
+    return false;
+  }
+  epoch++;
+  esp_err_t e1 = nvs_set_u32(h, "boot_ctr", epoch);
+  esp_err_t e2 = nvs_commit(h);
+  nvs_close(h);
+  if (e1 != ESP_OK || e2 != ESP_OK) {
+    Serial.printf("[crypto] CRITICAL: persistent epoch counter commit failed "
+                  "(set=%d commit=%d) -- refusing to start\n", e1, e2);
+    return false;
+  }
+  *out_epoch = epoch;
+  return true;
 }
 
-static void crypto_init() {
+// R5-01 (verification-memo hardening): crypto_init() is now fallible. No
+// random-epoch fallback exists anymore, and floor/watermark persistence
+// failures must fail closed (see crypto_verify() below) -- so without
+// durable NVS for either the epoch counter or the floor table, crypto
+// would come up "ready" but be unable to accept any traffic at all.
+// Refusing to start is more honest than that. Callers must check the
+// return value and keep ESP-NOW/crypto disabled on failure.
+static bool crypto_init() {
   memset(_crypto_replay, 0, sizeof(_crypto_replay));
   _crypto_tx_seq = 0;
-  _crypto_epoch = crypto_next_persistent_epoch();
+  if (!crypto_next_persistent_epoch(&_crypto_epoch)) {
+    _crypto_ready = false;
+    return false;
+  }
   esp_read_mac(_crypto_own_mac, ESP_MAC_WIFI_STA);
   _crypto_load_epoch_floors();
+  if (!_crypto_floor_nvs_ready) {
+    Serial.println("[crypto] CRITICAL: epoch-floor NVS unavailable -- refusing to start");
+    _crypto_ready = false;
+    return false;
+  }
   _crypto_ready = true;
   Serial.printf("[crypto] HMAC-SHA256 enabled (overhead=%d, epoch=0x%08X, replay_slots=%d)\n",
                 CRYPTO_OVERHEAD, _crypto_epoch, CRYPTO_REPLAY_SLOTS);
+  return true;
 }
 
 // Sign a frame in-place. The caller must have room for CRYPTO_OVERHEAD
@@ -222,6 +316,15 @@ static int crypto_verify(const uint8_t *src_mac,
     if (epoch == _crypto_replay[slot].epoch) {
       if (seq <= _crypto_replay[slot].last_seq)
         return 0;
+      // R5-01: only need to touch NVS when seq actually crosses the
+      // already-durable watermark -- the common case (seq within the
+      // reserved window) is a pure RAM comparison, no flash write.
+      if (seq > _crypto_replay[slot].accepted_through) {
+        uint32_t new_watermark = _crypto_next_watermark(seq);
+        if (!_crypto_persist_epoch_floor_candidate(slot, src_mac, epoch, new_watermark))
+          return 0;  // fail closed: never accept ahead of durable state
+        _crypto_replay[slot].accepted_through = new_watermark;
+      }
       _crypto_replay[slot].last_seq = seq;
     } else if (epoch > _crypto_replay[slot].epoch) {
       // New epoch — require silence period before accepting, as
@@ -229,10 +332,14 @@ static int crypto_verify(const uint8_t *src_mac,
       int64_t silence = now_us - _crypto_replay[slot].last_seen_us;
       if (silence < CRYPTO_EPOCH_SILENCE_US)
         return 0;
+      // R5-01: persist the new floor (epoch + fresh watermark) BEFORE
+      // accepting -- fail closed if it doesn't durably land.
+      uint32_t new_watermark = _crypto_next_watermark(seq);
+      if (!_crypto_persist_epoch_floor_candidate(slot, src_mac, epoch, new_watermark))
+        return 0;
       _crypto_replay[slot].epoch = epoch;
       _crypto_replay[slot].last_seq = seq;
-      // R5-01: persist the new floor so it survives a receiver reboot.
-      _crypto_persist_epoch_floors();
+      _crypto_replay[slot].accepted_through = new_watermark;
     } else {
       // R5-01: epoch is a persistent monotonic sender boot counter, so as
       // long as this slot's floor is remembered, any epoch not strictly
@@ -251,14 +358,17 @@ static int crypto_verify(const uint8_t *src_mac,
       if (age < CRYPTO_SLOT_STALE_US)
         return 0;
     }
+    // R5-01: persist this sender's initial floor (epoch + fresh watermark)
+    // BEFORE accepting -- fail closed if it doesn't durably land.
+    uint32_t new_watermark = _crypto_next_watermark(seq);
+    if (!_crypto_persist_epoch_floor_candidate(evict, src_mac, epoch, new_watermark))
+      return 0;
     memcpy(_crypto_replay[evict].mac, src_mac, 6);
     _crypto_replay[evict].epoch = epoch;
     _crypto_replay[evict].last_seq = seq;
+    _crypto_replay[evict].accepted_through = new_watermark;
     _crypto_replay[evict].last_seen_us = now_us;
     _crypto_replay[evict].active = true;
-    // R5-01: persist this sender's initial floor too, so a receiver
-    // reboot before any epoch transition doesn't forget it either.
-    _crypto_persist_epoch_floors();
   }
 
   return payload_len;

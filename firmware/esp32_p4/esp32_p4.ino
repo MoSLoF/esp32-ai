@@ -383,10 +383,16 @@ void setup() {
 #if USE_CRYPTO
   // R2-04: initialize crypto BEFORE espnow_begin so the RX callback
   // never processes frames under an unprovisioned key.
-  crypto_init();
+  // R5-01 (verification-memo hardening): crypto_init() is now fallible --
+  // no random-epoch fallback, and floor/watermark persistence failures
+  // must fail closed -- so a device that can't durably allocate/persist
+  // its epoch or replay-floor state must not bring up ESP-NOW crypto.
+  bool _crypto_ok = crypto_init();
+  if (!_crypto_ok)
+    Serial.println("[crypto] init FAILED -- ESP-NOW will remain disabled");
   // R2-04: load SD-based PSK before enabling ESP-NOW callbacks.
 #if USE_SD
-  {
+  if (_crypto_ok) {
     char psk_buf[64];
     int psk_n = sd_read_file(SD_CFG "/psk.txt", psk_buf, sizeof(psk_buf));
     if (psk_n > 0) {
@@ -404,9 +410,15 @@ void setup() {
   // R3-02: install crypto hooks BEFORE espnow_begin so the RX callback
   // never processes frames without authentication.
 #if USE_CRYPTO
-  espnow_set_crypto(crypto_sign, crypto_verify);
-#endif
+  if (_crypto_ok) {
+    espnow_set_crypto(crypto_sign, crypto_verify);
+    if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
+  } else {
+    Serial.println("[espnow] disabled: crypto_init() failed");
+  }
+#else
   if (!espnow_begin()) Serial.println("ESP-NOW init failed (continuing without)");
+#endif
 #endif
 
   // R4-01: preflight BEFORE any PSRAM staging to validate V/D invariants
