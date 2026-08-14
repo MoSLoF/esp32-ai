@@ -65,6 +65,11 @@ static int sign_test_frame(uint8_t *frame, uint32_t epoch, uint32_t seq,
 }
 
 int main(void) {
+  // Distinct from ATTACK_SENDER_MAC below -- R5-01's persisted per-MAC
+  // epoch floor (see crypto_peer.h's _crypto_persist_epoch_floors) means
+  // any frame accepted here would otherwise establish a floor that the
+  // attack sequence's own "epoch A" would collide with.
+  static const uint8_t SANITY_MAC[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   static const uint8_t SENDER_MAC[6] = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01};
 
   printf("=== R5-01: replay recovery must not reopen a retired epoch ===\n");
@@ -73,8 +78,8 @@ int main(void) {
   {
     crypto_init();
     uint8_t frame[32];
-    int len = sign_test_frame(frame, 1, 0, SENDER_MAC);
-    int vlen = crypto_verify(SENDER_MAC, frame, len);
+    int len = sign_test_frame(frame, 1, 0, SANITY_MAC);
+    int vlen = crypto_verify(SANITY_MAC, frame, len);
     CHECK(vlen == 1, "sanity: a validly-signed first frame is accepted");
   }
 
@@ -145,36 +150,41 @@ int main(void) {
           "captured epoch-A frame remains rejected after 19 later epochs and extended silence");
   }
 
-  // ---- Simulated receiver restart -------------------------------------
-  // The in-RAM replay slot is cleared (as it would be on a real reboot),
-  // but the persistent epoch counter (crypto_next_persistent_epoch, backed
-  // by the NVS stub) is what the sender uses -- the receiver simply has no
-  // memory of MAC->epoch anymore. This section proves the fix doesn't rely
-  // on the receiver's RAM state surviving: even a bare, unauthenticated
-  // MAC-level replay slot reset cannot help the attacker, because the
-  // signed epoch itself (A) will always compare as non-monotonic against
-  // any legitimately higher epoch this sender goes on to use, and separately,
-  // a fresh receiver has no basis to trust an old epoch without a fresh
-  // higher-epoch frame establishing the sender's floor first. This test
-  // asserts the concrete, in-repo-required property: after a slot reset,
-  // the first frame accepted for this MAC establishes a NEW floor, so the
-  // system integrator is responsible for reusing the SAME persistent
-  // receiver-side floor across reboots if long-term protection across
-  // receiver restarts (not just sender restarts) is required. Here we
-  // confirm the sender-restart scenario explicitly named in the finding.
-  crypto_init(); // receiver "reboots": in-RAM slots cleared, NVS floor persists
+  // ---- Simulated RECEIVER restart -- attacker wins the race ------------
+  // The in-RAM replay slot is cleared on every crypto_init() call, exactly
+  // as it would be on a real reboot. Without persisting each sender's
+  // epoch floor across that reboot, a captured old-epoch frame arriving
+  // FIRST after the receiver restarts would be treated as a fresh "first
+  // sighting" and accepted -- fully reopening the window this fix exists
+  // to close, via nothing more than an ordinary receiver reboot (crash,
+  // brownout, watchdog reset, OTA reboot -- all routine). This is the
+  // adversarial ordering: the attacker's captured frame is presented
+  // BEFORE any fresh legitimate frame re-establishes the floor.
+  crypto_init(); // receiver "reboots"
   {
-    // The receiver has forgotten this MAC. A frame at a brand new, higher
-    // epoch is accepted (first-seen), establishing a floor again.
+    int vlen = crypto_verify(SENDER_MAC, frame_A, frame_A_len);
+    CHECK(vlen == 0,
+          "receiver reboot: captured epoch-A frame is REJECTED even as the very first "
+          "frame seen post-reboot (persisted floor, not just in-RAM state)");
+  }
+  // A fresh, higher-epoch frame from the real sender must still work.
+  {
     uint32_t epoch_new = 100;
     uint8_t frame[32];
     int len = sign_test_frame(frame, epoch_new, 0, SENDER_MAC);
     int vlen = crypto_verify(SENDER_MAC, frame, len);
-    CHECK(vlen == 1, "post-restart: a fresh, high epoch establishes a new floor");
-    // Now the old captured epoch-A frame must still be rejected against
-    // that freshly-established floor.
-    int vlen2 = crypto_verify(SENDER_MAC, frame_A, frame_A_len);
-    CHECK(vlen2 == 0, "post-restart: captured epoch-A frame rejected against the new floor");
+    CHECK(vlen == 1, "receiver reboot: a genuinely fresh, higher epoch is still accepted");
+  }
+  // And a SECOND receiver reboot must persist that advanced floor too.
+  crypto_init();
+  {
+    uint32_t epoch_between = 50; // > A(1), but < 100 -- still retired relative to the new floor
+    uint8_t frame[32];
+    int len = sign_test_frame(frame, epoch_between, 0, SENDER_MAC);
+    int vlen = crypto_verify(SENDER_MAC, frame, len);
+    CHECK(vlen == 0,
+          "second receiver reboot: floor keeps advancing correctly, "
+          "an epoch below the latest persisted floor is still rejected");
   }
 
   // ---- Persistent monotonic epoch survives a sender reboot -------------

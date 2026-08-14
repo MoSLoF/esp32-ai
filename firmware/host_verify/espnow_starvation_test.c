@@ -150,17 +150,21 @@ int main(void) {
   CHECK(memcmp(g_last_delivered_mac, LEGIT_MAC, 6) == 0,
         "the delivered frame really is the legitimate peer's");
 
-  // ---- Bonded budget itself must still be finite (it's a rate limit, --
-  // ---- not unlimited priority) -- staying within the same 1-second ---
-  // ---- window, so the global ceiling is still tripped throughout. ----
-  int accepted_in_burst = 0;
-  for (int i = 0; i < ESPNOW_BONDED_MIN_RATE + 10; i++) {
+  // ---- Delivered throughput must still be finite overall (a guaranteed --
+  // ---- minimum via the bonded reserve, not unlimited priority) -- once --
+  // ---- both the bonded reserve (ESPNOW_BONDED_MIN_RATE) and the shared --
+  // ---- authenticated-reserve fallback (ESPNOW_RX_AUTHED_RESERVE) are ---
+  // ---- exhausted in the same congested window, further frames must be --
+  // ---- dropped, not delivered forever. -----------------------------
+  int accepted = 0;
+  const int BURST = ESPNOW_BONDED_MIN_RATE + ESPNOW_RX_AUTHED_RESERVE + 20;
+  for (int i = 0; i < BURST; i++) {
     int before = g_delivered_count;
     send_frame(LEGIT_MAC, true);
-    if (g_delivered_count > before) accepted_in_burst++;
+    if (g_delivered_count > before) accepted++;
   }
-  CHECK(accepted_in_burst <= ESPNOW_BONDED_MIN_RATE,
-        "bonded fast lane is itself rate-limited, not unlimited");
+  CHECK(accepted < BURST,
+        "delivered throughput is finite -- not every frame in an oversized burst gets through");
 
   // ---- An attacker MAC can never bond itself -- only a genuinely -----
   // ---- HMAC-verified sender can. -------------------------------------
@@ -168,6 +172,33 @@ int main(void) {
   for (int i = 0; i < 100; i++) send_frame(ATTACKER_MAC, false);
   CHECK(_espnow_bonded_slot(ATTACKER_MAC) < 0,
         "an unauthenticated attacker MAC is never granted a bonded slot");
+
+  // ---- Post-review hardening: an attacker spoofing the LEGITIMATE ----
+  // ---- peer's own (unauthenticated, radio-reported) source MAC with --
+  // ---- garbage must not be able to drain that peer's reserved budget -
+  // Move to a fresh rate-limit window, then re-trip the global ceiling
+  // (with distinct, unrelated MACs) so preauth_ok is false throughout --
+  // otherwise this scenario wouldn't exercise the reserved-budget path
+  // at all, since normal (non-congested) traffic never touches it.
+  host_mock_time_us += 1100000;
+  for (int i = 0; i < 500; i++) {
+    uint8_t mac[6] = {0xBA, 0xAD, 0xF0, 0x0D, (uint8_t)(i >> 8), (uint8_t)i};
+    send_frame(mac, false);
+  }
+  int spoof_delivered_before = g_delivered_count;
+  for (int i = 0; i < 200; i++) {
+    // Claims LEGIT_MAC as its source address but is not signed with the
+    // PSK -- exactly what an attacker spoofing the legitimate peer's own
+    // MAC would send. Every one of these must fail HMAC.
+    send_frame(LEGIT_MAC, false);
+  }
+  CHECK(g_delivered_count == spoof_delivered_before,
+        "200 garbage frames spoofing the legitimate peer's own MAC deliver nothing");
+  send_frame(LEGIT_MAC, true);
+  CHECK(g_delivered_count == spoof_delivered_before + 1,
+        "legitimate peer's genuinely-signed frame still delivered right after "
+        "a flood of garbage spoofing its own MAC -- the spoofed flood did not "
+        "drain its reserved budget");
 
   if (g_failures) {
     printf("\n%d check(s) FAILED\n", g_failures);

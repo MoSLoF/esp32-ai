@@ -28,9 +28,17 @@ typedef enum { NVS_READONLY, NVS_READWRITE } nvs_open_mode_t;
 
 #define HOST_NVS_MAX_NS   8
 #define HOST_NVS_MAX_KEYS 16
+#define HOST_NVS_MAX_BLOB_KEYS 4
+#define HOST_NVS_MAX_BLOB_LEN  512
 
 struct host_nvs_kv { char key[32]; uint32_t value; int used; };
-struct host_nvs_ns { char name[32]; struct host_nvs_kv kv[HOST_NVS_MAX_KEYS]; int used; };
+struct host_nvs_blob_kv { char key[32]; uint8_t data[HOST_NVS_MAX_BLOB_LEN]; size_t len; int used; };
+struct host_nvs_ns {
+  char name[32];
+  struct host_nvs_kv kv[HOST_NVS_MAX_KEYS];
+  struct host_nvs_blob_kv blob[HOST_NVS_MAX_BLOB_KEYS];
+  int used;
+};
 static struct host_nvs_ns host_nvs_store[HOST_NVS_MAX_NS];
 
 static inline esp_err_t nvs_open(const char *name, nvs_open_mode_t mode, nvs_handle_t *out) {
@@ -91,6 +99,41 @@ static inline esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t va
 
 static inline esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t value) {
   return nvs_set_u32(h, key, value);
+}
+
+static inline esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *out, size_t *len) {
+  struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  for (int i = 0; i < HOST_NVS_MAX_BLOB_KEYS; i++) {
+    if (ns->blob[i].used && strcmp(ns->blob[i].key, key) == 0) {
+      size_t n = ns->blob[i].len < *len ? ns->blob[i].len : *len;
+      memcpy(out, ns->blob[i].data, n);
+      *len = ns->blob[i].len;
+      return ESP_OK;
+    }
+  }
+  return ESP_ERR_NVS_NOT_FOUND;
+}
+
+static inline esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *value, size_t len) {
+  if (len > HOST_NVS_MAX_BLOB_LEN) return ESP_FAIL;
+  struct host_nvs_ns *ns = &host_nvs_store[h - 1];
+  for (int i = 0; i < HOST_NVS_MAX_BLOB_KEYS; i++) {
+    if (ns->blob[i].used && strcmp(ns->blob[i].key, key) == 0) {
+      memcpy(ns->blob[i].data, value, len);
+      ns->blob[i].len = len;
+      return ESP_OK;
+    }
+  }
+  for (int i = 0; i < HOST_NVS_MAX_BLOB_KEYS; i++) {
+    if (!ns->blob[i].used) {
+      ns->blob[i].used = 1;
+      strncpy(ns->blob[i].key, key, sizeof(ns->blob[i].key) - 1);
+      memcpy(ns->blob[i].data, value, len);
+      ns->blob[i].len = len;
+      return ESP_OK;
+    }
+  }
+  return ESP_FAIL;
 }
 
 static inline esp_err_t nvs_erase_key(nvs_handle_t h, const char *key) {

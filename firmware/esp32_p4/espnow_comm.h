@@ -82,6 +82,20 @@ static int64_t _espnow_rx_verify_overflow_window = 0;
 // checked and consumed independently of the unknown-source global ceiling,
 // the untrusted per-MAC cache, and the shared verification-overflow budget,
 // so MAC-rotation flooding from unauthenticated senders cannot starve it.
+//
+// Post-review hardening: the reserved budget below is consumed only AFTER
+// a frame actually passes HMAC verification -- never merely because a
+// frame's (unauthenticated, radio-reported) source MAC matches a bonded
+// entry. Source MACs are trivially spoofable, and this table is looked up
+// before verification runs; if the budget were consumed pre-verify, an
+// attacker could spoof a bonded peer's own MAC with garbage frames (which
+// always fail HMAC, since the attacker lacks the PSK) to drain that peer's
+// reserve without ever authenticating -- silently starving the exact peer
+// this table exists to protect. A bonded-slot match still lets a frame
+// bypass the shared pre-verify overflow gate (see the RX callback below), but
+// that's a cheap admission to attempt verification, not a scarce resource:
+// HMAC-SHA256 is inexpensive and every frame -- bonded-claimed or not --
+// is still bounded by the unconditional global ceiling below.
 static struct {
   uint8_t mac[6];
   bool active;
@@ -287,21 +301,22 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
   // 1. Pre-auth global ceiling applies to ALL traffic.
   // 2. R3-03: when pre-auth exhausted, check overflow verification budget
   //    to bound HMAC attempts, then verify, then check authed reserve.
-  // R5-02: a bonded (previously-authenticated) peer's reserved budget is
-  // checked independently and, when it grants the frame, bypasses the
-  // shared global/overflow/authed-reserve gates entirely -- those are the
-  // budgets an unauthenticated MAC-rotation flood can exhaust.
+  // R5-02: a claimed-bonded MAC bypasses the shared pre-verify overflow
+  // gate (cheap: verification itself is still the real gate, and every
+  // frame is still bounded by the unconditional global ceiling below) --
+  // but its RESERVED budget is only consumed after verification actually
+  // succeeds, see _espnow_bonded[] above for why.
   int64_t now_us = esp_timer_get_time();
   bool preauth_ok = _espnow_mac_ratelimit(info->src_addr, now_us);
   int bonded_slot = _espnow_bonded_slot(info->src_addr);
-  bool bonded_ok = (bonded_slot >= 0) && _espnow_bonded_budget(bonded_slot, now_us);
+  bool bonded_claim = (bonded_slot >= 0);
 
   // EA-08: when crypto is enabled, verify ALL frame types.
   int verified_len = len;
   if (_espnow_verify_fn) {
     // R4-02: when pre-auth exhausted, tracked peers use per-MAC overflow;
     // unknown MACs use global overflow budget.
-    if (!preauth_ok && !bonded_ok) {
+    if (!preauth_ok && !bonded_claim) {
       bool overflow_ok = _espnow_peer_overflow_budget(info->src_addr, now_us);
       if (!overflow_ok && !_espnow_verify_overflow_budget(now_us)) {
         _espnow_diag_preauth_drop++;
@@ -310,9 +325,18 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
     }
     verified_len = _espnow_verify_fn(info->src_addr, data, len);
     if (verified_len <= 0) return;
-    // R5-02: this MAC just proved PSK possession -- bond it so its future
-    // traffic gets a reserved budget immune to unknown-MAC starvation.
-    if (bonded_slot < 0) espnow_provision_peer(info->src_addr);
+    // This MAC just proved PSK possession -- bond it (or refresh its
+    // slot) so its future traffic gets a reserved budget immune to
+    // unknown-MAC starvation.
+    if (bonded_slot < 0) {
+      espnow_provision_peer(info->src_addr);
+      bonded_slot = _espnow_bonded_slot(info->src_addr);
+    }
+    // R5-02: the reserved budget is consumed HERE -- only for a frame
+    // that has already passed HMAC. A spoofed frame merely claiming a
+    // bonded MAC can never reach this line, so it can never drain the
+    // reserve that protects the real peer.
+    bool bonded_ok = (bonded_slot >= 0) && _espnow_bonded_budget(bonded_slot, now_us);
     // R3-03: only decrement authenticated reserve AFTER successful HMAC.
     if (!preauth_ok && !bonded_ok) {
       if (!_espnow_authed_budget(now_us)) {
@@ -322,7 +346,7 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
       _espnow_diag_authed_pass++;
     }
   } else {
-    if (!preauth_ok && !bonded_ok) {
+    if (!preauth_ok && !bonded_claim) {
       _espnow_diag_preauth_drop++;
       return;
     }

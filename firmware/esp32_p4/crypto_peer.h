@@ -64,6 +64,17 @@ static uint32_t _crypto_tx_seq = 0;
 #define CRYPTO_REPLAY_SLOTS 16
 #define CRYPTO_EPOCH_SILENCE_US 5000000  // 5s silence before accepting new epoch
 // R4-05: stale threshold for slot eviction (unrelated to epoch ordering).
+// Known residual limitation: CRYPTO_REPLAY_SLOTS bounds how many distinct
+// senders' epoch floors can be tracked/persisted at once. If a sender goes
+// silent for over CRYPTO_SLOT_STALE_US while >= CRYPTO_REPLAY_SLOTS other
+// *authenticated* senders are active, its slot (and persisted floor) can
+// be evicted to make room; if that sender's MAC is then seen again, it is
+// treated as a first sighting. Closing this fully would require unbounded
+// per-sender storage; CRYPTO_REPLAY_SLOTS=16 is sized well above the
+// expected flock size as a practical mitigation. Note this eviction still
+// requires the evicting traffic to itself be HMAC-authenticated (fail
+// closed for unknown MACs below), so an attacker without the PSK cannot
+// trigger it.
 #define CRYPTO_SLOT_STALE_US       60000000  // 60s stale threshold for slot eviction
 static struct {
   uint8_t mac[6];
@@ -72,6 +83,67 @@ static struct {
   int64_t last_seen_us;
   bool active;
 } _crypto_replay[CRYPTO_REPLAY_SLOTS];
+
+// R5-01 (post-review hardening): the epoch floor recorded in
+// _crypto_replay[] above lives in RAM and is wiped by crypto_init() on
+// every boot. A persistent, NVS-backed sender epoch alone isn't enough --
+// without also remembering each sender's floor across a *receiver* reboot,
+// a captured old-epoch frame arriving first after the receiver restarts is
+// accepted as a fresh "first sighting", reopening the exact replay window
+// the monotonic epoch was meant to close permanently. Only mac+epoch are
+// persisted (not seq/timestamps): epoch transitions happen once per remote
+// sender boot, not per packet, so this write is rare and doesn't wear the
+// flash the way a per-packet write would.
+typedef struct __attribute__((packed)) {
+  uint8_t mac[6];
+  uint32_t epoch;
+  uint8_t active;
+} CryptoFloorEntry;
+
+static nvs_handle_t _crypto_floor_nvs;
+static bool _crypto_floor_nvs_ready = false;
+
+static void _crypto_load_epoch_floors() {
+  if (nvs_open("crypto_floor", NVS_READWRITE, &_crypto_floor_nvs) != ESP_OK) {
+    Serial.println("[crypto] WARNING: epoch-floor NVS unavailable — "
+                   "sender epoch floors will not survive a receiver reboot");
+    _crypto_floor_nvs_ready = false;
+    return;
+  }
+  _crypto_floor_nvs_ready = true;
+
+  CryptoFloorEntry buf[CRYPTO_REPLAY_SLOTS];
+  size_t len = sizeof(buf);
+  if (nvs_get_blob(_crypto_floor_nvs, "floors", buf, &len) == ESP_OK &&
+      len == sizeof(buf)) {
+    for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
+      if (buf[i].active) {
+        memcpy(_crypto_replay[i].mac, buf[i].mac, 6);
+        _crypto_replay[i].epoch = buf[i].epoch;
+        _crypto_replay[i].active = true;
+        // last_seq/last_seen_us intentionally stay at 0 -- only the epoch
+        // floor needs to survive a reboot, not live sequence state.
+      }
+    }
+  }
+}
+
+static void _crypto_persist_epoch_floors() {
+  if (!_crypto_floor_nvs_ready) return;
+  CryptoFloorEntry buf[CRYPTO_REPLAY_SLOTS];
+  memset(buf, 0, sizeof(buf));
+  for (int i = 0; i < CRYPTO_REPLAY_SLOTS; i++) {
+    if (_crypto_replay[i].active) {
+      memcpy(buf[i].mac, _crypto_replay[i].mac, 6);
+      buf[i].epoch = _crypto_replay[i].epoch;
+      buf[i].active = 1;
+    }
+  }
+  esp_err_t e1 = nvs_set_blob(_crypto_floor_nvs, "floors", buf, sizeof(buf));
+  esp_err_t e2 = nvs_commit(_crypto_floor_nvs);
+  if (e1 != ESP_OK || e2 != ESP_OK)
+    Serial.printf("[crypto] WARNING: failed to persist epoch floor (set=%d commit=%d)\n", e1, e2);
+}
 
 // R5-01: persistent monotonic epoch. A random per-boot epoch has no
 // ordering relation across reboots, which is what forced the old design
@@ -102,6 +174,7 @@ static void crypto_init() {
   _crypto_tx_seq = 0;
   _crypto_epoch = crypto_next_persistent_epoch();
   esp_read_mac(_crypto_own_mac, ESP_MAC_WIFI_STA);
+  _crypto_load_epoch_floors();
   _crypto_ready = true;
   Serial.printf("[crypto] HMAC-SHA256 enabled (overhead=%d, epoch=0x%08X, replay_slots=%d)\n",
                 CRYPTO_OVERHEAD, _crypto_epoch, CRYPTO_REPLAY_SLOTS);
@@ -158,11 +231,14 @@ static int crypto_verify(const uint8_t *src_mac,
         return 0;
       _crypto_replay[slot].epoch = epoch;
       _crypto_replay[slot].last_seq = seq;
+      // R5-01: persist the new floor so it survives a receiver reboot.
+      _crypto_persist_epoch_floors();
     } else {
-      // R5-01: epoch is a persistent monotonic sender boot counter, so any
-      // epoch not strictly greater than the highest ever accepted from this
-      // sender is permanently retired. Unlike the old bounded ring, there
-      // is no eviction path that can make this epoch valid again later.
+      // R5-01: epoch is a persistent monotonic sender boot counter, so as
+      // long as this slot's floor is remembered, any epoch not strictly
+      // greater than it is permanently retired -- there is no ring or
+      // time-based path that reopens it (see CRYPTO_SLOT_STALE_US above
+      // for the one, bounded, authenticated-eviction-only exception).
       return 0;
     }
     _crypto_replay[slot].last_seen_us = now_us;
@@ -180,6 +256,9 @@ static int crypto_verify(const uint8_t *src_mac,
     _crypto_replay[evict].last_seq = seq;
     _crypto_replay[evict].last_seen_us = now_us;
     _crypto_replay[evict].active = true;
+    // R5-01: persist this sender's initial floor too, so a receiver
+    // reboot before any epoch transition doesn't forget it either.
+    _crypto_persist_epoch_floors();
   }
 
   return payload_len;

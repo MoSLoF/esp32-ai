@@ -1834,9 +1834,20 @@ def test_r4_05_sender_recovery():
 # (firmware/host_verify/*_test.c, against host-side ESP-IDF/Arduino stubs
 # in firmware/host_verify/stubs/) to reproduce each finding's exact attack
 # or failure sequence, rather than re-implementing the logic in Python or
-# grepping for keywords. Each has independently been confirmed to fail when
-# run against firmware source from the assessed commit (0784d57) and pass
-# against the fix.
+# grepping for keywords.
+#
+# Verification note: each test's attack/failure sequence was independently
+# reproduced against the actual pre-fix source (commit 0784d57) -- with the
+# runtime logic exercised and observed to fail, not merely a compile-time
+# API mismatch -- by temporarily hand-adapting each test to the old
+# function signatures. That scratch verification isn't checked in (the
+# tests here target the current, fixed API and won't compile at all against
+# the old one, since e.g. crypto_env_sign/crypto_env_verify gained a mac
+# parameter and crypto_next_persistent_epoch/_espnow_bonded_slot/
+# ota_verify_abandon_stage didn't exist yet). Compiling one of these tests
+# against a reverted change is still a fast way to confirm that change is
+# what the test depends on, even though the failure mode in that case is a
+# compiler error rather than a runtime assertion.
 
 def _find_c_compiler():
     for cc in ("cc", "gcc", "clang"):
