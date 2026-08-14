@@ -28,6 +28,8 @@
 
 #include "mbedtls/pk.h"
 #include "mbedtls/sha256.h"
+#include "esp_partition.h"
+#include "esp_ota_ops.h"
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <string.h>
@@ -82,22 +84,91 @@ static struct {
 static mbedtls_sha256_context _otav_sha_ctx;
 static bool _otav_sha_active = false;
 
-// R4-03: recover pending counter on boot — if a staged counter exists
-// from a power-loss between stage and commit, finalize it now.
+// R5-03: two-phase counter journal. Superseded the old single "ota_pending"
+// key, which recorded only the counter -- recovery had no way to tell
+// "staged but power lost before the boot partition was switched" (old
+// image still running) apart from "boot partition was switched, only the
+// final commit was lost" (new image now running). Journaling the target
+// partition alongside the counter lets recovery ask ground truth (which
+// partition actually booted?) instead of assuming the switch happened.
+#define OTA_JOURNAL_PHASE_NONE   0
+#define OTA_JOURNAL_PHASE_STAGED 1
+
+// R5-03: erase the journal keys and check every result. Used both to
+// finish a successful commit and to abandon a staged-but-never-activated
+// transaction (either right after esp_ota_set_boot_partition fails, or
+// during boot recovery).
+static void _ota_verify_clear_journal(const char *ctx) {
+  esp_err_t e1 = nvs_erase_key(_otav_nvs, "pend_phase");
+  esp_err_t e2 = nvs_erase_key(_otav_nvs, "pend_ctr");
+  esp_err_t e3 = nvs_erase_key(_otav_nvs, "pend_part");
+  esp_err_t e4 = nvs_commit(_otav_nvs);
+  bool ok = (e1 == ESP_OK || e1 == ESP_ERR_NVS_NOT_FOUND) &&
+            (e2 == ESP_OK || e2 == ESP_ERR_NVS_NOT_FOUND) &&
+            (e3 == ESP_OK || e3 == ESP_ERR_NVS_NOT_FOUND) &&
+            e4 == ESP_OK;
+  if (!ok)
+    Serial.printf("[ota-verify] WARNING: journal cleanup (%s) failed "
+                  "(erase=%d/%d/%d commit=%d) -- stale keys may remain\n",
+                  ctx, e1, e2, e3, e4);
+}
+
+// R5-03: abandon a staged-but-not-yet-activated transaction immediately
+// (e.g. esp_ota_set_boot_partition just failed) rather than waiting for a
+// reboot for recovery to figure it out. The counter is left untouched so
+// the same manifest can be retried.
+static void ota_verify_abandon_stage() {
+  _ota_verify_clear_journal("abandon");
+}
+
+// R4-03/R5-03: recover from a power loss during a previous OTA commit.
+// Compares the journaled target partition against the partition that
+// actually booted -- ground truth, not assumed intent -- to decide
+// whether the update took effect.
 static void _ota_verify_recover() {
-  uint32_t pending = 0;
-  esp_err_t err = nvs_get_u32(_otav_nvs, "ota_pending", &pending);
-  if (err == ESP_OK && pending > 0) {
+  uint8_t phase = OTA_JOURNAL_PHASE_NONE;
+  if (nvs_get_u8(_otav_nvs, "pend_phase", &phase) != ESP_OK ||
+      phase == OTA_JOURNAL_PHASE_NONE)
+    return;
+
+  uint32_t pend_ctr = 0;
+  uint8_t pend_subtype = 0xFF;
+  nvs_get_u32(_otav_nvs, "pend_ctr", &pend_ctr);
+  nvs_get_u8(_otav_nvs, "pend_part", &pend_subtype);
+
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  bool activated = running != NULL && running->subtype == pend_subtype;
+
+  if (activated) {
+    // The journaled target partition is the one that actually booted --
+    // the switch took effect, so the update genuinely completed. Finish
+    // committing the counter (this also covers a crash between
+    // esp_ota_set_boot_partition succeeding and the final commit).
     uint32_t current = 0;
     nvs_get_u32(_otav_nvs, "sec_ctr", &current);
-    if (pending > current) {
-      nvs_set_u32(_otav_nvs, "sec_ctr", pending);
-      nvs_commit(_otav_nvs);
-      Serial.printf("[ota-verify] recovered pending counter %u\n", pending);
+    if (pend_ctr > current) {
+      esp_err_t e1 = nvs_set_u32(_otav_nvs, "sec_ctr", pend_ctr);
+      esp_err_t e2 = nvs_commit(_otav_nvs);
+      if (e1 != ESP_OK || e2 != ESP_OK) {
+        Serial.printf("[ota-verify] CRITICAL: recovery counter commit failed "
+                      "(set=%d commit=%d) -- counter/partition state may be inconsistent\n",
+                      e1, e2);
+      } else {
+        Serial.printf("[ota-verify] recovered: activated partition confirmed, counter -> %u\n",
+                      pend_ctr);
+      }
     }
-    nvs_erase_key(_otav_nvs, "ota_pending");
-    nvs_commit(_otav_nvs);
+  } else {
+    // The running partition does NOT match the journaled target: power
+    // was lost before esp_ota_set_boot_partition took effect (or it
+    // failed), so the old image is still running. Do not burn the
+    // counter for an update that never activated -- abandon the journal
+    // so the same signed manifest can be retried at the same counter.
+    Serial.println("[ota-verify] recovery: staged update was never activated "
+                   "(old partition still running) -- abandoning, counter left untouched");
   }
+
+  _ota_verify_clear_journal("recover");
 }
 
 static bool ota_verify_init() {
@@ -226,20 +297,28 @@ static bool ota_verify_sha_finish() {
   return true;
 }
 
-// R4-03: stage the counter to NVS as "pending" before changing boot partition.
-static bool ota_verify_stage_counter() {
-  if (!_otav_manifest.valid) return false;
-  esp_err_t e1 = nvs_set_u32(_otav_nvs, "ota_pending", _otav_manifest.sec_counter);
-  esp_err_t e2 = nvs_commit(_otav_nvs);
-  if (e1 != ESP_OK || e2 != ESP_OK) {
-    Serial.printf("[ota-verify] stage counter failed: set=%d commit=%d\n", e1, e2);
+// R4-03/R5-03: stage the full transaction journal (target partition +
+// pending counter + explicit phase) to NVS BEFORE changing the boot
+// partition, so a power loss before the switch takes effect can be told
+// apart from one after, and the counter is never committed for an update
+// that never actually activated.
+static bool ota_verify_stage_counter(const esp_partition_t *target) {
+  if (!_otav_manifest.valid || !target) return false;
+  esp_err_t e1 = nvs_set_u8(_otav_nvs, "pend_phase", OTA_JOURNAL_PHASE_STAGED);
+  esp_err_t e2 = nvs_set_u32(_otav_nvs, "pend_ctr", _otav_manifest.sec_counter);
+  esp_err_t e3 = nvs_set_u8(_otav_nvs, "pend_part", target->subtype);
+  esp_err_t e4 = nvs_commit(_otav_nvs);
+  if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK || e4 != ESP_OK) {
+    Serial.printf("[ota-verify] stage transaction failed: phase=%d ctr=%d part=%d commit=%d\n",
+                  e1, e2, e3, e4);
     return false;
   }
   return true;
 }
 
-// FR-08: commit security counter AFTER all checks pass (CRC + SHA + OTA end).
-// R4-03: also clears the pending key to complete the two-phase journal.
+// FR-08: commit security counter AFTER all checks pass (CRC + SHA + OTA end)
+// and the boot partition switch has already succeeded.
+// R4-03/R5-03: also clears the journal to complete the two-phase transaction.
 static bool ota_verify_commit_counter() {
   if (!_otav_manifest.valid) return false;
   esp_err_t e1 = nvs_set_u32(_otav_nvs, "sec_ctr", _otav_manifest.sec_counter);
@@ -248,9 +327,11 @@ static bool ota_verify_commit_counter() {
     Serial.printf("[ota-verify] NVS commit failed: set=%d commit=%d\n", e1, e2);
     return false;
   }
-  // R4-03: clear pending key to complete two-phase journal.
-  nvs_erase_key(_otav_nvs, "ota_pending");
-  nvs_commit(_otav_nvs);
+  // If cleanup below fails, the counter is already correctly committed to
+  // match the partition that is about to boot, so the leftover journal is
+  // merely stale: next boot's recovery will see running == pend_part,
+  // re-commit the same (already-correct) counter, and clear it then.
+  _ota_verify_clear_journal("commit");
   Serial.printf("[ota-verify] counter updated to %u\n", _otav_manifest.sec_counter);
   return true;
 }

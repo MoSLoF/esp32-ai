@@ -50,6 +50,11 @@ static const uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #define ESPNOW_RX_AUTHED_RESERVE  100
 #define ESPNOW_RX_VERIFY_OVERFLOW 50
 #define ESPNOW_RX_PEER_OVERFLOW   10
+// R5-02: bonded (proven-authenticated) peer budget. Separate from
+// ESPNOW_RX_MAC_SLOTS -- that cache is populated by ANY source MAC before
+// authentication and is therefore attacker-evictable by MAC rotation.
+#define ESPNOW_BONDED_SLOTS       4
+#define ESPNOW_BONDED_MIN_RATE    20
 
 static struct {
   uint8_t mac[6];
@@ -67,6 +72,23 @@ static int64_t _espnow_rx_authed_window = 0;
 // R3-03: overflow verification budget — bounds HMAC attempts when pre-auth exhausted.
 static uint32_t _espnow_rx_verify_overflow_count = 0;
 static int64_t _espnow_rx_verify_overflow_window = 0;
+
+// R5-02: bonded-peer table. A MAC is only ever added here after it has
+// successfully passed HMAC verification at least once (see
+// espnow_provision_peer(), called from the RX callback below on a
+// successful verify) -- an attacker without the PSK cannot get an entry
+// created no matter how many MACs it rotates through.
+// Once bonded, a peer keeps a reserved receive/verification rate that is
+// checked and consumed independently of the unknown-source global ceiling,
+// the untrusted per-MAC cache, and the shared verification-overflow budget,
+// so MAC-rotation flooding from unauthenticated senders cannot starve it.
+static struct {
+  uint8_t mac[6];
+  bool active;
+  uint16_t count;
+  int64_t window;
+  int64_t last_seen_us;
+} _espnow_bonded[ESPNOW_BONDED_SLOTS];
 
 // FR-06: diagnostic counters.
 static uint32_t _espnow_diag_preauth_drop = 0;
@@ -195,6 +217,49 @@ static bool _espnow_verify_overflow_budget(int64_t now_us) {
   return (++_espnow_rx_verify_overflow_count <= ESPNOW_RX_VERIFY_OVERFLOW);
 }
 
+// R5-02: look up a bonded peer slot by MAC. Returns -1 if not bonded.
+static int _espnow_bonded_slot(const uint8_t *mac) {
+  for (int i = 0; i < ESPNOW_BONDED_SLOTS; i++) {
+    if (_espnow_bonded[i].active && memcmp(_espnow_bonded[i].mac, mac, 6) == 0)
+      return i;
+  }
+  return -1;
+}
+
+// R5-02: record a MAC as bonded after it has proven possession of the PSK
+// via a successful HMAC verification. Only ever called with an
+// already-authenticated MAC (see the RX callback below) -- unauthenticated
+// traffic can never create or evict an entry here. When all slots are full, the
+// least-recently-seen bonded peer is replaced; that eviction is still only
+// reachable by another authenticated peer, never by unknown-source traffic.
+static void espnow_provision_peer(const uint8_t *mac) {
+  if (_espnow_bonded_slot(mac) >= 0) return;
+  int slot = -1;
+  int64_t oldest = INT64_MAX;
+  for (int i = 0; i < ESPNOW_BONDED_SLOTS; i++) {
+    if (!_espnow_bonded[i].active) { slot = i; break; }
+    if (_espnow_bonded[i].last_seen_us < oldest) {
+      oldest = _espnow_bonded[i].last_seen_us; slot = i;
+    }
+  }
+  memcpy(_espnow_bonded[slot].mac, mac, 6);
+  _espnow_bonded[slot].active = true;
+  _espnow_bonded[slot].count = 0;
+  _espnow_bonded[slot].window = 0;
+  _espnow_bonded[slot].last_seen_us = esp_timer_get_time();
+}
+
+// R5-02: reserved receive budget for a bonded peer, independent of the
+// global pre-auth ceiling and the untrusted-MAC cache's per-MAC budget.
+static bool _espnow_bonded_budget(int slot, int64_t now_us) {
+  if (now_us - _espnow_bonded[slot].window > 1000000) {
+    _espnow_bonded[slot].count = 0;
+    _espnow_bonded[slot].window = now_us;
+  }
+  _espnow_bonded[slot].last_seen_us = now_us;
+  return (++_espnow_bonded[slot].count <= ESPNOW_BONDED_MIN_RATE);
+}
+
 // R4-02: per-MAC overflow budget for tracked peers.
 static bool _espnow_peer_overflow_budget(const uint8_t *mac, int64_t now_us) {
   for (int i = 0; i < ESPNOW_RX_MAC_SLOTS; i++) {
@@ -222,15 +287,21 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
   // 1. Pre-auth global ceiling applies to ALL traffic.
   // 2. R3-03: when pre-auth exhausted, check overflow verification budget
   //    to bound HMAC attempts, then verify, then check authed reserve.
+  // R5-02: a bonded (previously-authenticated) peer's reserved budget is
+  // checked independently and, when it grants the frame, bypasses the
+  // shared global/overflow/authed-reserve gates entirely -- those are the
+  // budgets an unauthenticated MAC-rotation flood can exhaust.
   int64_t now_us = esp_timer_get_time();
   bool preauth_ok = _espnow_mac_ratelimit(info->src_addr, now_us);
+  int bonded_slot = _espnow_bonded_slot(info->src_addr);
+  bool bonded_ok = (bonded_slot >= 0) && _espnow_bonded_budget(bonded_slot, now_us);
 
   // EA-08: when crypto is enabled, verify ALL frame types.
   int verified_len = len;
   if (_espnow_verify_fn) {
     // R4-02: when pre-auth exhausted, tracked peers use per-MAC overflow;
     // unknown MACs use global overflow budget.
-    if (!preauth_ok) {
+    if (!preauth_ok && !bonded_ok) {
       bool overflow_ok = _espnow_peer_overflow_budget(info->src_addr, now_us);
       if (!overflow_ok && !_espnow_verify_overflow_budget(now_us)) {
         _espnow_diag_preauth_drop++;
@@ -239,8 +310,11 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
     }
     verified_len = _espnow_verify_fn(info->src_addr, data, len);
     if (verified_len <= 0) return;
+    // R5-02: this MAC just proved PSK possession -- bond it so its future
+    // traffic gets a reserved budget immune to unknown-MAC starvation.
+    if (bonded_slot < 0) espnow_provision_peer(info->src_addr);
     // R3-03: only decrement authenticated reserve AFTER successful HMAC.
-    if (!preauth_ok) {
+    if (!preauth_ok && !bonded_ok) {
       if (!_espnow_authed_budget(now_us)) {
         _espnow_diag_preauth_drop++;
         return;
@@ -248,7 +322,7 @@ static void _espnow_rx(const esp_now_recv_info_t *info, const uint8_t *data, int
       _espnow_diag_authed_pass++;
     }
   } else {
-    if (!preauth_ok) {
+    if (!preauth_ok && !bonded_ok) {
       _espnow_diag_preauth_drop++;
       return;
     }
@@ -302,6 +376,7 @@ static bool espnow_begin() {
   esp_now_add_peer(&peer);
 
   memset(_espnow_rx_mac, 0, sizeof(_espnow_rx_mac));
+  memset(_espnow_bonded, 0, sizeof(_espnow_bonded));
 
   Serial.println("ESP-NOW ready (broadcast)");
   return true;

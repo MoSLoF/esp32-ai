@@ -21,12 +21,16 @@ Usage:
 
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 FIRMWARE_DIR = Path(__file__).parent.parent / "firmware" / "esp32_p4"
 COMMON_DIR = Path(__file__).parent.parent / "firmware" / "common"
 SENDER_DIR = Path(__file__).parent.parent / "firmware" / "espnow_sender"
+HOST_VERIFY_DIR = Path(__file__).parent.parent / "firmware" / "host_verify"
 
 # All feature flags and their required headers.
 FEATURE_FLAGS = {
@@ -954,15 +958,17 @@ def test_fr02_mac_based_replay():
 
 
 def test_fr02_epoch_alternation_prevention():
-    """FR-02/R2-02: Must prevent epoch alternation/cycling attacks."""
+    """FR-02/R2-02/R5-01: Must prevent epoch alternation/cycling attacks."""
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
-    # R2-02: upgraded from prev_epoch to a bounded retired-epoch ring.
-    assert "retired" in crypto, (
-        "replay table must track retired epochs"
+    # R5-01: upgraded from a bounded/time-evicted retired-epoch ring to a
+    # persistent monotonic counter -- a strictly-greater-than comparison
+    # replaces the ring, and a lesser-or-equal epoch is rejected forever.
+    assert "crypto_next_persistent_epoch" in crypto, (
+        "epoch must come from a persistent monotonic counter"
     )
-    assert "CRYPTO_RETIRED_EPOCHS" in crypto, (
-        "must define retired epoch ring size"
+    assert "epoch > _crypto_replay[slot].epoch" in crypto, (
+        "a new epoch must be strictly greater than the last accepted epoch"
     )
     assert "CRYPTO_EPOCH_SILENCE_US" in crypto, (
         "must have silence period before accepting new epoch"
@@ -1180,18 +1186,27 @@ def test_r2_01_stdbool_in_llm():
 
 
 def test_r2_02_retired_epoch_ring():
-    """R2-02: crypto_peer.h must use a bounded retired-epoch ring."""
+    """R2-02/R5-01: crypto_peer.h must permanently reject superseded epochs.
+
+    Originally via a bounded retired-epoch ring; R5-01 replaced that with a
+    persistent monotonic counter, since a bounded/time-evicted ring could
+    itself be forced to re-admit a retired epoch (see R5-01 tests below).
+    """
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
-    assert "CRYPTO_RETIRED_EPOCHS" in crypto, (
-        "must define retired epoch ring size"
+    assert "crypto_next_persistent_epoch" in crypto, (
+        "epoch must come from a persistent monotonic counter"
     )
-    assert "retired_count" in crypto, (
-        "replay slot must track how many retired epochs are stored"
+    # R5-01: a lesser-or-equal epoch must be rejected unconditionally, with
+    # no eviction/recovery path that can ever re-admit it.
+    assert "epoch > _crypto_replay[slot].epoch" in crypto, (
+        "epoch comparison must be strictly monotonic"
     )
-    # R3-01: retired ring is now fail-closed (reject when full, no FIFO eviction).
-    assert "retired_count >= CRYPTO_RETIRED_EPOCHS" in crypto, (
-        "retired ring must reject when full (fail-closed)"
+    verify_fn = crypto[crypto.index("static int crypto_verify("):]
+    monotonic_idx = verify_fn.index("epoch > _crypto_replay[slot].epoch")
+    permanently_retired = verify_fn[monotonic_idx:monotonic_idx + 700]
+    assert "R5-01" in permanently_retired and "return 0" in permanently_retired, (
+        "the non-monotonic (retired epoch) branch must unconditionally reject"
     )
 
 
@@ -1201,8 +1216,12 @@ def test_r2_02_sender_epoch_silence():
     assert "SENDER_EPOCH_SILENCE_MS" in sender, (
         "sender must define epoch silence period"
     )
-    assert "SENDER_RETIRED_EPOCHS" in sender, (
-        "sender must track retired epochs"
+    # R5-01: retired-epoch ring replaced with a persistent monotonic counter.
+    assert "sender_next_persistent_epoch" in sender, (
+        "sender epoch must come from a persistent monotonic counter"
+    )
+    assert "ep > _sender_replay[slot].epoch" in sender, (
+        "sender epoch comparison must be strictly monotonic"
     )
 
 
@@ -1355,15 +1374,23 @@ def test_r2_07_ratelimit_before_hmac():
 # ---- R3 (Remediation Reassessment Round 3) tests ---------------------------
 
 def test_r3_01_fail_closed_retired_ring():
-    """R3-01: Replay must reject when retired epoch ring is full (R4-05 adds recovery)."""
+    """R3-01/R5-01: Replay must permanently reject a superseded epoch.
+
+    R5-01 replaced the bounded/time-evicted retired-epoch ring (which this
+    test used to check for fail-closed-when-full behavior) with a
+    persistent monotonic counter, so there is no ring capacity to exhaust
+    and no recovery window that can ever re-admit an old epoch.
+    """
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
-    assert "retired_count >= CRYPTO_RETIRED_EPOCHS" in crypto, (
-        "must check retired ring capacity"
+    assert "crypto_next_persistent_epoch" in crypto, (
+        "epoch must come from a persistent monotonic counter"
     )
-    # R4-05: recovery is allowed after extended silence; default still rejects.
-    assert "CRYPTO_RECOVERY_SILENCE_US" in crypto, (
-        "must define recovery silence threshold for retired ring eviction"
+    assert "CRYPTO_RETIRED_EPOCHS" not in crypto, (
+        "bounded retired-epoch ring must be removed (R5-01)"
+    )
+    assert "CRYPTO_RECOVERY_SILENCE_US" not in crypto, (
+        "time-based retired-epoch recovery must be removed (R5-01)"
     )
 
 
@@ -1371,9 +1398,7 @@ def test_r3_01_fail_closed_replay_slots():
     """R3-01: Replay must reject unknown MACs when all slots are active (R4-05 adds stale eviction)."""
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
-    # Find the new-MAC branch (second "R3-01: fail closed" occurrence).
-    first_idx = crypto.index("R3-01: fail closed")
-    new_mac_idx = crypto.index("R3-01: fail closed", first_idx + 1)
+    new_mac_idx = crypto.index("R3-01: fail closed")
     new_mac_section = crypto[new_mac_idx:new_mac_idx + 400]
     assert "_crypto_replay[evict].active" in new_mac_section, (
         "must check evict slot is inactive before accepting new MAC"
@@ -1388,14 +1413,18 @@ def test_r3_01_fail_closed_replay_slots():
 
 
 def test_r3_01_sender_fail_closed():
-    """R3-01: Sender replay must also be fail-closed (R4-05 adds recovery)."""
+    """R3-01/R5-01: Sender replay must permanently reject a superseded epoch
+    and must still be fail-closed for unknown MACs when all slots are active.
+    """
     sender = (SENDER_DIR / "espnow_sender.ino").read_text()
-    assert "retired_count >= SENDER_RETIRED_EPOCHS" in sender, (
-        "sender must check retired ring capacity"
+    assert "sender_next_persistent_epoch" in sender, (
+        "sender epoch must come from a persistent monotonic counter"
     )
-    # R4-05: recovery is allowed after extended silence; default still rejects.
-    assert "SENDER_RECOVERY_SILENCE_MS" in sender, (
-        "sender must define recovery silence threshold"
+    assert "SENDER_RETIRED_EPOCHS" not in sender, (
+        "bounded retired-epoch ring must be removed (R5-01)"
+    )
+    assert "SENDER_RECOVERY_SILENCE_MS" not in sender, (
+        "time-based retired-epoch recovery must be removed (R5-01)"
     )
     assert "_sender_replay[evict].active" in sender, (
         "sender must reject unknown MACs when all slots active"
@@ -1433,7 +1462,7 @@ def test_r3_02_crypto_before_begin():
 def test_r3_02_sender_crypto_before_rx():
     """R3-02: Sender must init crypto before registering RX callback."""
     sender = (SENDER_DIR / "espnow_sender.ino").read_text()
-    crypto_pos = sender.index("_sender_epoch = esp_random()")
+    crypto_pos = sender.index("_sender_epoch = sender_next_persistent_epoch()")
     rx_cb_pos = sender.index("esp_now_register_recv_cb(on_rx)")
     assert crypto_pos < rx_cb_pos, (
         "sender crypto init must happen before esp_now_register_recv_cb"
@@ -1650,14 +1679,19 @@ def test_r4_02_tracked_peer_fast_lane():
 
 
 def test_r4_03_two_phase_counter_journal():
-    """R4-03: OTA must use two-phase counter journal (stage → boot → commit)."""
+    """R4-03/R5-03: OTA must use a two-phase journal (stage → boot → commit).
+
+    R5-03 widened the journal from a single counter key to also record the
+    target partition and an explicit phase, so recovery can tell "staged"
+    apart from "activated" (see the R5-03 tests below).
+    """
     verify = read_file("ota_verify.h")
     assert verify is not None
     assert "ota_verify_stage_counter" in verify, (
         "must have ota_verify_stage_counter function"
     )
-    assert 'ota_pending' in verify, (
-        "must use 'ota_pending' NVS key for staging"
+    assert 'pend_phase' in verify and 'pend_ctr' in verify and 'pend_part' in verify, (
+        "must journal an explicit phase, the pending counter, and the target partition"
     )
 
 
@@ -1676,26 +1710,32 @@ def test_r4_03_boot_time_recovery():
 
 
 def test_r4_03_stage_before_boot_partition():
-    """R4-03: Counter must be staged BEFORE set_boot_partition."""
+    """R4-03: Journal must be staged BEFORE set_boot_partition."""
     ota = read_file("ota_espnow.h")
     assert ota is not None
     finalize_section = ota[ota.index("esp_ota_end(_ota.handle)"):]
-    stage_pos = finalize_section.index("ota_verify_stage_counter()")
+    stage_pos = finalize_section.index("ota_verify_stage_counter(_ota.part)")
     boot_pos = finalize_section.index("esp_ota_set_boot_partition(_ota.part)")
     assert stage_pos < boot_pos, (
-        "counter must be staged before set_boot_partition"
+        "journal must be staged (with the target partition) before set_boot_partition"
     )
 
 
 def test_r4_03_commit_clears_pending():
-    """R4-03: Counter commit must clear the pending NVS key."""
+    """R4-03/R5-03: Counter commit must clear the pending journal keys."""
     verify = read_file("ota_verify.h")
     assert verify is not None
     commit_fn = verify[verify.index("static bool ota_verify_commit_counter()"):]
     commit_fn = commit_fn[:commit_fn.index("\n}\n") + 3]
-    assert 'nvs_erase_key' in commit_fn and 'ota_pending' in commit_fn, (
-        "commit_counter must clear ota_pending key"
+    assert '_ota_verify_clear_journal' in commit_fn, (
+        "commit_counter must clear the pending journal"
     )
+    clear_fn = verify[verify.index("static void _ota_verify_clear_journal("):]
+    clear_fn = clear_fn[:clear_fn.index("\n}\n") + 3]
+    for key in ("pend_phase", "pend_ctr", "pend_part"):
+        assert f'"{key}"' in clear_fn and 'nvs_erase_key' in clear_fn, (
+            f"journal cleanup must erase the {key} key"
+        )
 
 
 def test_r4_03_rollback_result_check():
@@ -1724,14 +1764,17 @@ def test_r4_04_sender_init_ordering():
 
 
 def test_r4_05_crypto_recovery_silence():
-    """R4-05: Crypto must define recovery silence threshold for retired ring."""
+    """R4-05/R5-01: the old retired-ring recovery-silence eviction is gone.
+
+    R5-01 found that CRYPTO_RECOVERY_SILENCE_US's FIFO eviction of the
+    retired-epoch ring could itself be used to reopen a retired epoch after
+    enough epoch churn plus a silence period -- exactly the reassessment's
+    replay-recovery finding. It's removed, not reintroduced.
+    """
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
-    assert "CRYPTO_RECOVERY_SILENCE_US" in crypto, (
-        "must define CRYPTO_RECOVERY_SILENCE_US"
-    )
-    assert "30000000" in crypto, (
-        "recovery silence must be 30s (30000000 us)"
+    assert "CRYPTO_RECOVERY_SILENCE_US" not in crypto, (
+        "time-based retired-epoch recovery must not be reintroduced (R5-01)"
     )
 
 
@@ -1748,40 +1791,135 @@ def test_r4_05_crypto_stale_eviction():
 
 
 def test_r4_05_crypto_retired_recovery():
-    """R4-05: Crypto must FIFO evict oldest retired epoch after recovery silence."""
+    """R4-05/R5-01: no FIFO eviction path can ever re-admit a retired epoch.
+
+    Superseded by the R5-01 fix: epoch is a persistent monotonic counter,
+    so "retired" means permanently retired -- there is nothing left to
+    evict or recover.
+    """
     crypto = read_file("crypto_peer.h")
     assert crypto is not None
+    assert "retired_count" not in crypto, (
+        "bounded retired-epoch ring bookkeeping must be removed (R5-01)"
+    )
     verify_fn = crypto[crypto.index("crypto_verify("):]
     verify_fn = verify_fn[:verify_fn.index("\n}\n") + 3]
-    # Recovery path: after retired ring full, check recovery silence then FIFO.
-    retired_check = verify_fn.index("retired_count >= CRYPTO_RETIRED_EPOCHS")
-    recovery_section = verify_fn[retired_check:retired_check + 400]
-    assert "CRYPTO_RECOVERY_SILENCE_US" in recovery_section, (
-        "retired ring recovery must check CRYPTO_RECOVERY_SILENCE_US"
-    )
-    assert ".retired_count--" in recovery_section, (
-        "recovery must decrement retired_count after FIFO eviction"
+    assert "epoch <= _crypto_replay[slot].epoch" not in verify_fn, (
+        "epoch check should read as a positive strictly-greater-than test"
     )
 
 
 def test_r4_05_sender_recovery():
-    """R4-05: Sender must have the same recovery pattern."""
+    """R4-05/R5-01: sender must match crypto_peer.h's monotonic-epoch fix
+    and must still evict stale, inactive replay slots (unrelated concern).
+    """
     sender = (SENDER_DIR / "espnow_sender.ino").read_text()
-    assert "SENDER_RECOVERY_SILENCE_MS" in sender, (
-        "sender must define SENDER_RECOVERY_SILENCE_MS"
+    assert "SENDER_RECOVERY_SILENCE_MS" not in sender, (
+        "time-based retired-epoch recovery must not be reintroduced (R5-01)"
+    )
+    assert "retired_count" not in sender, (
+        "bounded retired-epoch ring bookkeeping must be removed (R5-01)"
     )
     assert "SENDER_SLOT_STALE_MS" in sender, (
         "sender must define SENDER_SLOT_STALE_MS"
     )
-    # Check FIFO eviction in sender.
-    retired_idx = sender.index("retired_count >= SENDER_RETIRED_EPOCHS")
-    recovery_section = sender[retired_idx:retired_idx + 400]
-    assert "SENDER_RECOVERY_SILENCE_MS" in recovery_section, (
-        "sender retired ring recovery must check SENDER_RECOVERY_SILENCE_MS"
+
+
+# ---- R5 (Remediation Reassessment Round 5) tests ----------------------
+#
+# The R5 reassessment's core critique of the earlier test suite was that it
+# validated source strings, constants, and call ordering rather than
+# executing the actual security state transitions under attack or power
+# loss. The three tests below compile and RUN the real firmware source
+# (firmware/host_verify/*_test.c, against host-side ESP-IDF/Arduino stubs
+# in firmware/host_verify/stubs/) to reproduce each finding's exact attack
+# or failure sequence, rather than re-implementing the logic in Python or
+# grepping for keywords. Each has independently been confirmed to fail when
+# run against firmware source from the assessed commit (0784d57) and pass
+# against the fix.
+
+def _find_c_compiler():
+    for cc in ("cc", "gcc", "clang"):
+        path = shutil.which(cc)
+        if path:
+            return path
+    return None
+
+
+def _compile_and_run_host_test(c_filename):
+    """Compile a firmware/host_verify/*.c behavioral test against the host
+    stubs and run it, returning (returncode, stdout+stderr)."""
+    cc = _find_c_compiler()
+    assert cc is not None, (
+        "a C compiler (cc/gcc/clang) is required to run behavioral tests in "
+        f"{HOST_VERIFY_DIR} -- install one or see firmware/host_verify/stubs/"
     )
-    assert ".retired_count--" in recovery_section, (
-        "sender must decrement retired_count after FIFO eviction"
-    )
+    src = HOST_VERIFY_DIR / c_filename
+    assert src.exists(), f"missing behavioral test source: {src}"
+    with tempfile.TemporaryDirectory() as tmp:
+        out_bin = os.path.join(tmp, "host_test_bin")
+        compile_cmd = [
+            cc, "-std=c11", "-I", str(HOST_VERIFY_DIR / "stubs"),
+            "-o", out_bin, str(src),
+        ]
+        compile_result = subprocess.run(
+            compile_cmd, capture_output=True, text=True, timeout=60
+        )
+        assert compile_result.returncode == 0, (
+            f"failed to compile {c_filename}:\n{compile_result.stdout}\n{compile_result.stderr}"
+        )
+        run_result = subprocess.run(
+            [out_bin], capture_output=True, text=True, timeout=60
+        )
+        return run_result.returncode, run_result.stdout + run_result.stderr
+
+
+def test_r5_01_replay_epoch_behavioral():
+    """R5-01 (HIGH): replay recovery must not reopen a retired epoch.
+
+    Executes crypto_peer.h's actual replay state machine through the exact
+    attack sequence from the reassessment: a sender progresses through six
+    epochs (more than the old design's 4-entry retired ring), and a frame
+    captured under the first epoch must remain rejected forever afterward
+    -- through repeated recovery-length silences and a simulated receiver
+    restart -- not just until the ring's FIFO eviction happens to age it out.
+    """
+    rc, output = _compile_and_run_host_test("crypto_replay_test.c")
+    assert rc == 0, f"behavioral test failed:\n{output}"
+
+
+def test_r5_02_mac_starvation_behavioral():
+    """R5-02 (MEDIUM): MAC-rotation flooding must not starve a provisioned peer.
+
+    Executes espnow_comm.h's actual RX rate-limiting state machine through
+    the reassessment's "Validated starvation sequence": seed a legitimate
+    peer, flood 500 frames from rotating unauthenticated MACs (evicting the
+    legitimate peer from the untrusted-MAC cache and tripping the global
+    ceiling), then 50 more invalid frames exhausting the shared
+    verification-overflow budget -- and the legitimate peer's next valid
+    frame must still get through, and continue to for as long as its own
+    reserved (but finite) budget allows.
+    """
+    rc, output = _compile_and_run_host_test("espnow_starvation_test.c")
+    assert rc == 0, f"behavioral test failed:\n{output}"
+
+
+def test_r5_03_ota_journal_behavioral():
+    """R5-03 (MEDIUM): the OTA counter/partition journal must stay
+    consistent across power loss at every phase boundary.
+
+    Executes ota_verify.h's actual staging/commit/recovery functions
+    (including _ota_verify_recover(), invoked exactly as the real firmware
+    calls it from ota_verify_init() at boot) across five scenarios: power
+    loss before the boot-partition switch takes effect (must NOT burn the
+    counter, and the same manifest must be retryable afterward), power loss
+    after the switch but before commit (must finish committing), a clean
+    same-boot completion, esp_ota_set_boot_partition() itself failing, and
+    a crash during final journal cleanup after the counter is already
+    committed.
+    """
+    rc, output = _compile_and_run_host_test("ota_journal_test.c")
+    assert rc == 0, f"behavioral test failed:\n{output}"
 
 
 if __name__ == "__main__":

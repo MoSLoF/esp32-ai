@@ -21,6 +21,7 @@
 #define OTA_PUSH_H
 
 #include <esp_now.h>
+#include <esp_mac.h>
 #include <string.h>
 #include "../common/crypto_envelope.h"
 
@@ -45,6 +46,10 @@ static const char *_otap_psk = CRYPTO_PSK;
 static uint32_t *_otap_epoch_ptr = NULL;
 static uint32_t *_otap_tx_seq_ptr = NULL;
 static bool _otap_crypto_enabled = false;
+// This device's own MAC, bound into the HMAC as additional authenticated
+// data (R5-02) so a captured valid frame can't be replayed under a
+// different claimed source MAC.
+static uint8_t _otap_own_mac[6];
 
 static struct {
   uint8_t *fw;
@@ -91,7 +96,7 @@ static void _otap_send_signed(const uint8_t *dest, uint8_t *frame,
                                int len) {
   if (_otap_crypto_enabled && len > 0 && _otap_epoch_ptr && _otap_tx_seq_ptr) {
     uint32_t seq = (*_otap_tx_seq_ptr)++;
-    len = crypto_env_sign(_otap_psk, frame, len, *_otap_epoch_ptr, seq);
+    len = crypto_env_sign(_otap_psk, _otap_own_mac, frame, len, *_otap_epoch_ptr, seq);
   }
   esp_now_send(dest, frame, len);
 }
@@ -104,7 +109,7 @@ static void _otap_rx(const esp_now_recv_info_t *info,
   int verified_len = len;
   if (_otap_crypto_enabled) {
     uint32_t ep, sq;
-    verified_len = crypto_env_verify(_otap_psk, d, len, &ep, &sq);
+    verified_len = crypto_env_verify(_otap_psk, info->src_addr, d, len, &ep, &sq);
     if (verified_len <= 0) return;
   }
 
@@ -317,6 +322,7 @@ static void ota_push_init() {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   _otap.device_id = _otap_crc32(mac, 6);
+  memcpy(_otap_own_mac, mac, 6);
 }
 
 #endif

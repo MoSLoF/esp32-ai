@@ -347,8 +347,9 @@ static void ota_tick() {
               _ota_tx_status(OTA_STATUS_ERROR);
               _ota.state = OTA_IDLE;
             } else {
-              // R4-03: two-phase counter journal: stage → set_boot → commit.
-              if (!ota_verify_stage_counter()) {
+              // R4-03/R5-03: two-phase counter journal: stage (with target
+              // partition) → set_boot → commit.
+              if (!ota_verify_stage_counter(_ota.part)) {
                 Serial.println("[ota] counter staging failed");
                 _ota_tx_status(OTA_STATUS_ERROR);
                 _ota.state = OTA_IDLE;
@@ -357,6 +358,10 @@ static void ota_tick() {
                 esp_err_t eb = esp_ota_set_boot_partition(_ota.part);
                 if (eb != ESP_OK) {
                   Serial.printf("[ota] set_boot_partition failed: %d\n", eb);
+                  // R5-03: the switch never took effect -- abandon the
+                  // staged journal now instead of leaving it for a reboot
+                  // to sort out, so a retry isn't blocked on stale state.
+                  ota_verify_abandon_stage();
                   _ota_tx_status(OTA_STATUS_ERROR);
                   _ota.state = OTA_IDLE;
                   ota_verify_reset();
