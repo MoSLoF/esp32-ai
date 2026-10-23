@@ -1,49 +1,48 @@
-# Running a 28.9M parameter LLM on an $8 microcontroller
+# esp32-ai: a 28.9M-parameter LLM on ESP32 microcontrollers
 
-<p align="center">
-  Open to Work &nbsp;·&nbsp;
-  <a href="https://x.com/slvDev">𝕏 slvDev</a> &nbsp;·&nbsp;
-  <a href="https://www.linkedin.com/in/slvdev/">LinkedIn</a>
-</p>
+[![CI](https://github.com/MoSLoF/esp32-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/MoSLoF/esp32-ai/actions/workflows/ci.yml)
 
-![28.9M-parameter LLM running on an ESP32-S3](media/esp32-ple-demo.gif)
+A fork of [slvDev/esp32-llm](https://github.com/slvDev/esp32-llm), which runs a
+28.9 million parameter language model entirely on an ESP32-S3. This fork ports
+it to the ESP32-P4 and adds a networking layer so boards can find each other,
+verify each other's models, and pass signed messages and firmware updates
+around.
 
-This is a 28.9 million parameter language model that generates text on an ESP32-S3,
-a microcontroller that costs about $8. It runs on the chip itself, with nothing
-sent to a server, and it writes each word to a small screen wired to the chip at
-roughly 9 tokens per second. The last language model people ran on a chip like this had 260
-thousand parameters, so this one holds about a hundred times more. It fits because
-most of the model lives in flash instead of RAM, using an idea from Google's Gemma
-models called Per-Layer Embeddings.
+![28.9M-parameter LLM running on an ESP32-S3 (upstream demo)](media/esp32-ple-demo.gif)
 
-## The numbers
+## Status
 
-|              |                                                               |
-| ------------ | ------------------------------------------------------------- |
-| Parameters   | 28.9M stored (25M of them in a flash lookup table)            |
-| Chip         | ESP32-S3, about $8, with 512KB SRAM, 8MB PSRAM and 16MB flash |
-| Speed        | about 9.5 tok/s end to end (9.7 tok/s of pure compute)        |
-| Connectivity | none, everything runs on the device                           |
-| Model size   | 14.9MB at 4-bit                                               |
+Be clear-eyed about what has and hasn't been proven:
 
-## Why it is hard, and how it fits anyway
+| Part | State |
+| --- | --- |
+| S3 inference (`firmware/esp32_llm`) | Measured on hardware upstream: ~9.5 tok/s on an ESP32-S3 N16R8 |
+| P4 inference (`firmware/esp32_p4`) | Compiles in CI; not yet confirmed on hardware in this repo |
+| P4 display, SD card, companion UART | Compile in CI; not hardware-tested |
+| P4 ESP-NOW stack (peer protocol, OTA, mesh) | **Blocked**: doesn't build for the P4 (see below) |
+| ESP-NOW sender, LoRa bridge | Compile in CI; not hardware-tested |
+| Crypto, replay, and OTA-journal logic | Behavioral host tests in `firmware/host_verify/` |
 
-A microcontroller has very little fast memory. The ESP32-S3 gives you 512KB of SRAM.
-Normally the whole model has to be reachable from there, which keeps you stuck with
-tiny models, and that is why the previous model on a chip like this had only 260
-thousand parameters.
+**The P4 can't do ESP-NOW yet.** The P4 has no radio. Arduino-ESP32 reaches
+its companion ESP32-C6 through `esp_wifi_remote`, which carries Wi-Fi but not
+ESP-NOW, so `esp_now_*` never links. Espressif's own ESP-NOW library says the
+same thing. Enabling `USE_ESPNOW`, `USE_PEER_PROTOCOL`, `USE_OTA` or
+`USE_MESH` on the P4 stops the build with an explicit error. Likely ways
+forward: run the ESP-NOW side on the C6 itself and bridge to the P4 over UART
+or SDIO, or put the P4 networking on an S3 (which has native ESP-NOW).
 
-The way around it is to stop putting the model in fast memory at all. Most of a
-language model's parameters sit in an embedding table, which the model reads from
-rather than computes on. So you can leave that 25 million row table in slow flash
-and pull only the few rows each token needs, about 450 bytes, while the small part
-that does the actual work stays in fast memory. The large model then costs almost
-nothing to run, because you never load most of it. It just sits in flash and gets
-sampled a little at a time.
+## How the model fits (upstream's idea)
 
-That idea is Google's Per-Layer Embeddings, from Gemma 3n and Gemma 4. Here it runs
-on the memory layout of a microcontroller instead of a phone or a GPU. As far as I
-can tell, nobody had tried it on a chip this small.
+A microcontroller has very little fast memory: the ESP32-S3 has 512KB of SRAM.
+Normally the whole model has to be reachable from there, which is why the
+previous LLM on a chip like this had 260 thousand parameters.
+
+The trick is that most of a language model's parameters sit in an embedding
+table, which the model looks rows up in rather than computing on. So the
+25-million-row table stays in slow flash, and each token pulls only the few rows
+it needs (about 450 bytes), while the small part that does the actual work stays
+in fast memory. This is Google's Per-Layer Embeddings design from Gemma 3n and
+Gemma 4, applied to a microcontroller's memory layout.
 
 ```
   SRAM  (fast, tiny)   the "thinking" core, used on every token
@@ -51,38 +50,84 @@ can tell, nobody had tried it on a chip this small.
   FLASH (huge, slow)   the 25M-param table, about 6 rows read per token (~450 B)
 ```
 
-## What it does, and what it does not
+|              |                                                               |
+| ------------ | ------------------------------------------------------------- |
+| Parameters   | 28.9M stored (25M of them in a flash lookup table)            |
+| Speed (S3)   | about 9.5 tok/s end to end (9.7 tok/s of pure compute)        |
+| Model size   | 14.9MB at 4-bit                                               |
+| Connectivity | none needed: inference runs entirely on the device            |
 
-The model was trained on TinyStories, so it writes short, simple stories and mostly
-keeps them coherent. It will not answer questions, follow instructions, write code,
-or know facts. That limit comes from the small part of the model that does the
-reasoning, and the memory trick does not change it. What is interesting here is the
-architecture, fitting a large model onto a tiny chip, rather than what a 28.9 million
-parameter model can say.
+The model is trained on TinyStories, so it writes short, simple stories. It
+won't answer questions, follow instructions, or know facts. The interesting
+part is the memory architecture, not what a 28.9M-parameter model can say.
+The method, ablations and on-chip measurements are in [`RESULTS.md`](RESULTS.md).
 
-## Running it yourself
+## What this fork adds
 
-The firmware, the wiring, and the flashing steps live in
-[`firmware/esp32_llm/README.md`](firmware/esp32_llm/README.md). The training,
-ablation, and quantization code is in `src/` and `experiments/`. The full method,
-the ablations, and the on-chip measurements are written up in
-[`RESULTS.md`](RESULTS.md).
+All in `firmware/`, each P4 feature behind a `USE_*` flag in `esp32_p4.ino`
+(default off; override with `-DUSE_X=1`):
+
+- **ESP32-P4 port** (`esp32_p4/`): same model and `common/llm.h` runtime as
+  the S3, with P4 platform plumbing. See [`esp32_p4/README.md`](firmware/esp32_p4/README.md).
+- **Peer protocol** (`peer_protocol.h`, `peer_identity.h`): boards discover
+  each other and challenge each other with prompts to check they run the same
+  model.
+- **Signed frames** (`crypto_peer.h`, `common/crypto_envelope.h`): HMAC with
+  per-sender epochs and replay protection. `CRYPTO_PSK` must be provided at
+  build time; there's no default key.
+- **OTA over ESP-NOW** (`ota_espnow.h`, `ota_verify.h`): ECDSA P-256 signed
+  manifests, anti-rollback, and a recovery journal. Keys come from
+  `tools/ota_keygen.py`; manifests are signed with `tools/ota_sign_manifest.py`.
+- **Mesh relay** (`mesh_relay.h`), **SD card config and logging**
+  (`sd_config.h`), **companion UART JSON** (`companion_uart.h`), and a
+  **MIPI-DSI display** driver (`display.h`).
+- **Companion sketches**: `espnow_sender/` (prompt sender and OTA pusher for
+  any ESP32 with native Wi-Fi) and `lora_bridge/` (links clusters beyond
+  ESP-NOW range).
+
+Several rounds of adversarial security review shaped the crypto and OTA code;
+the commit history records each finding and fix.
+
+## Layout
+
+```
+src/                 training, quantization, export (PyTorch)
+data/                TinyStories preparation
+experiments/         ablation and sweep runners
+firmware/common/     portable C inference runtime + crypto envelope
+firmware/esp32_llm/  S3 sketch (upstream)
+firmware/esp32_p4/   P4 sketch and feature headers (this fork)
+firmware/host_verify/  host-side C tests and golden verification
+tests/               firmware smoke tests
+tools/               OTA key/manifest tools, CI helpers
+```
+
+## Building and testing
+
+The S3 build, flashing and model export are in
+[`firmware/esp32_llm/README.md`](firmware/esp32_llm/README.md); the P4 build is
+in [`firmware/esp32_p4/README.md`](firmware/esp32_p4/README.md).
+
+CI runs on every push and pull request:
+
+- `python tests/smoke_test_p4.py`: static checks on the firmware sources, plus
+  the behavioral C tests in `firmware/host_verify/`. Needs only Python 3.12 and
+  a C compiler.
+- `tools/ci_compile.sh`: compiles every sketch with arduino-cli against
+  Arduino-ESP32 3.3.10, including the P4 with all buildable features on. It
+  writes a stub `vocab.h` and throwaway keys, so its binaries are for compile
+  checking only. Never flash them.
 
 ## Credit
 
-TinyStories is the dataset this trains on: short synthetic stories simple enough
-that a small model can still learn to write coherently (Ronen Eldan and Yuanzhi Li,
-Microsoft Research, [arXiv:2305.07759](https://arxiv.org/abs/2305.07759)). The other
-half is Per-Layer Embeddings, Google's design from the Gemma models, which is what
-lets a big model fit on a small chip.
+The model, training pipeline, S3 firmware and results are
+[slvDev](https://github.com/slvDev)'s work in
+[esp32-llm](https://github.com/slvDev/esp32-llm), MIT licensed (see
+[`LICENSE`](LICENSE)). Upstream left its messy history in on purpose,
+including a parameter-accounting bug found and corrected along the way;
+`RESULTS.md` shows where the numbers moved and why.
 
-Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) is why a lot of
-people, me included, believe you can train a tiny language model and run it in plain
-C at all. This grew out of that.
-
-## How this actually went
-
-I left the messy history in the repo on purpose. That includes a bug I found in my
-own parameter accounting, which had inflated an early number, and the corrected
-result that followed once I fixed it. The commit history and `RESULTS.md` show where
-the numbers moved and why.
+Upstream builds on TinyStories (Ronen Eldan and Yuanzhi Li, Microsoft Research,
+[arXiv:2305.07759](https://arxiv.org/abs/2305.07759)), Google's Per-Layer
+Embeddings from the Gemma models, and Andrej Karpathy's
+[llama2.c](https://github.com/karpathy/llama2.c).

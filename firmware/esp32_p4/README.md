@@ -4,7 +4,7 @@ This sketch runs the 28.9M-parameter PLE TinyLM on an ESP32-P4 development
 board. Same model binary, same `llm.h` inference engine, same vocab as the S3
 build — the P4 port changes only the platform plumbing.
 
-Tested with the Waveshare ESP32-P4-Module and ESP32-P4-WIFI6 dev boards
+Written for the Waveshare ESP32-P4-Module and ESP32-P4-WIFI6 dev boards
 (ESP32-P4NRW32 module, 32 MB flash, 32 MB PSRAM).
 
 ## What's different from the S3 build
@@ -31,28 +31,46 @@ cc -O3 -o /tmp/esp32-llm-verify firmware/host_verify/verify.c -lm
 /tmp/esp32-llm-verify firmware/model/model.bin firmware/model/golden.txt
 ```
 
-Build with Arduino ESP32 core (requires P4 support, core 3.x+):
+Build with Arduino ESP32 core 3.3.10 (the version CI compiles against):
 
 ```bash
 arduino-cli compile \
-  --fqbn 'esp32:esp32:esp32p4:CPUFreq=400,FlashMode=qio,FlashSize=32M,PartitionScheme=custom,PSRAM=enabled' \
+  --fqbn 'esp32:esp32:esp32p4:FlashMode=qio,FlashSize=32M,PartitionScheme=custom,PSRAM=enabled' \
   --build-property compiler.optimization_flags=-O3 \
   --build-path /tmp/esp32-p4-build \
   firmware/esp32_p4
 ```
 
-**Note:** The ESP32-P4 Arduino board package is evolving. If the FQBN above
-doesn't match your installed board definitions, run `arduino-cli board details
---fqbn esp32:esp32:esp32p4` to list available options, and adjust `CPUFreq`,
-`PSRAM`, and `FlashSize` accordingly. Alternatively, build with ESP-IDF
-directly using `idf.py` (the code is ESP-IDF-compatible C).
+**Note:** The P4 board definition has no `CPUFreq` menu option (it runs at
+400 MHz), and passing one fails with `invalid option 'CPUFreq'`. The ESP32-P4
+Arduino board package is still evolving; if the FQBN above stops matching your
+installed core, run `arduino-cli board details --fqbn esp32:esp32:esp32p4` to
+list the current options.
+
+Feature flags (`USE_DISPLAY`, `USE_SD`, ...) default to off in `esp32_p4.ino`.
+Edit the defaults there or override them per build, e.g.
+`--build-property "compiler.cpp.extra_flags=-DUSE_SD=1"`. `tools/ci_compile.sh`
+shows the full set CI builds.
+
+## ESP-NOW is not available on the P4 (yet)
+
+The P4 has no radio. Arduino-ESP32 talks to the companion ESP32-C6 through
+`esp_wifi_remote`, which carries Wi-Fi but not ESP-NOW: `esp_now_*` doesn't
+link, and Espressif's own ESP-NOW library warns that it "is only supported in
+SoCs with native Wi-Fi support". So `USE_ESPNOW`, and the features that need it
+(`USE_PEER_PROTOCOL`, `USE_OTA`, `USE_MESH`), stop the build with an explicit
+`#error` on this target. CI checks that this guard fires.
+
+Options for getting the networking layer onto real hardware: run the ESP-NOW
+side on the C6 and bridge frames to the P4 over UART or SDIO, or run the
+networked node on an ESP32-S3 (native ESP-NOW) alongside the P4.
 
 ## Flash and run
 
 ```bash
 arduino-cli upload \
   -p /dev/ttyUSB0 \
-  --fqbn 'esp32:esp32:esp32p4:CPUFreq=400,FlashMode=qio,FlashSize=32M,PartitionScheme=custom,PSRAM=enabled' \
+  --fqbn 'esp32:esp32:esp32p4:FlashMode=qio,FlashSize=32M,PartitionScheme=custom,PSRAM=enabled' \
   --input-dir /tmp/esp32-p4-build \
   firmware/esp32_p4
 
@@ -79,10 +97,10 @@ PSRAM free after alloc: ~26000 KB
 ## Phase 2: MIPI-DSI display
 
 The 7" 1024x600 IPS panel on the Waveshare ESP32-P4-WIFI6-Touch-LCD-7B
-connects via MIPI-DSI, not SPI. A `display.h` for this panel is planned.
-Set `USE_DISPLAY 1` once it's written — the sketch's display API
-(`display_begin`, `display_puts`, `display_stats`) is identical to the S3
-build.
+connects via MIPI-DSI, not SPI. `display.h` drives it through the ESP-IDF
+MIPI-DSI driver and compiles in CI with `USE_DISPLAY=1`, but hasn't been
+checked against the real panel yet. The sketch's display API (`display_begin`,
+`display_puts`, `display_stats`) is identical to the S3 build.
 
 ## Phase 3: Voice output (TTS)
 

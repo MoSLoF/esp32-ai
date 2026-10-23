@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # Static checks plus the behavioral C tests in firmware/host_verify
+      # (the smoke test compiles and runs those itself).
+      - name: Firmware smoke tests
+        run: python tests/smoke_test_p4.py
+
+      # verify.c and ppl.c need an exported model to run; this only proves
+      # the portable C runtime still compiles on the host.
+      - name: Build host verification tools
+        run: |
+          cc -O2 -Wall -o "$RUNNER_TEMP/verify" firmware/host_verify/verify.c -lm
+          cc -O2 -Wall -o "$RUNNER_TEMP/ppl" firmware/host_verify/ppl.c -lm
+
+  firmware:
+    name: Firmware compile
+    runs-on: ubuntu-latest
+    env:
+      ESP32_CORE_VERSION: 3.3.10
+      ESP32_INDEX_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache Arduino core and libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-esp32-${{ env.ESP32_CORE_VERSION }}-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Install ESP32 core and libraries
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli lib install \
+            "Adafruit GFX Library@1.13.0" \
+            "Adafruit BusIO@1.17.4" \
+            "Adafruit SH110X@2.1.15" \
+            "Adafruit SSD1306@2.5.17" \
+            "Adafruit ST7735 and ST7789 Library@1.12.0" \
+            "RadioLib@7.8.1"
+
+      - name: Compile all sketches
+        env:
+          CI_WORK_DIR: ${{ runner.temp }}/fw
+        run: tools/ci_compile.sh
