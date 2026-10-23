@@ -20,6 +20,7 @@
 #define DISPLAY_H
 
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_io.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_heap_caps.h"
 #include <string.h>

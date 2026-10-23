@@ -22,15 +22,17 @@
 #include "../esp32_llm/vocab.h"   // shared token->text table for decoding RX
 #include "../common/crypto_envelope.h"
 #include "sender_replay.h"
-#include "ota_push.h"
 
 #define ESPNOW_MSG_TOKEN  0x01
 #define ESPNOW_MSG_PROMPT 0x02
 
+// Defined before ota_push.h, which sends to ESPNOW_BROADCAST.
 static const uint8_t BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #ifndef ESPNOW_BROADCAST
 #define ESPNOW_BROADCAST BROADCAST
 #endif
+
+#include "ota_push.h"
 
 // EA-04: sender-side crypto state.
 #ifndef USE_CRYPTO

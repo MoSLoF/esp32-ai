@@ -37,6 +37,18 @@
 #include <string.h>
 #include "peer_identity.h"
 
+#if USE_SD
+// Defined in sd_config.h, which is included after this header (it needs
+// PEER_PROMPT_LEN from here), so declare what we call.
+static bool sd_log_encounter(const char *our_name, const char *peer_name,
+                             uint32_t peer_id, const char *event);
+static bool sd_log_bond(const char *our_name, const char *peer_name,
+                        uint32_t peer_id, int bond_num);
+static void sd_record_peer(const char *peer_name, uint32_t peer_id);
+static int sd_challenge_count();
+static const int *sd_challenge(int i, int *len);
+#endif
+
 #define ESPNOW_MSG_IDENTITY  0x04
 #define ESPNOW_MSG_CHALLENGE 0x05
 #define ESPNOW_MSG_RESPONSE  0x06

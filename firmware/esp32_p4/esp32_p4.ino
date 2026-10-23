@@ -22,14 +22,31 @@
 #include "../esp32_llm/vocab.h"   // shared tokenizer assets
 
 // ---- feature flags ---------------------------------------------------------
+// Edit the defaults here, or override per build with -DUSE_X=1 (CI does this).
+#ifndef USE_DISPLAY
 #define USE_DISPLAY       0   // MIPI-DSI panel (display.h)
+#endif
+#ifndef USE_ESPNOW
 #define USE_ESPNOW        0   // ESP-NOW transport (espnow_comm.h)
+#endif
+#ifndef USE_PEER_PROTOCOL
 #define USE_PEER_PROTOCOL 0   // peer discovery + validation (peer_protocol.h)
+#endif
+#ifndef USE_OTA
 #define USE_OTA           0   // OTA updates over ESP-NOW (ota_espnow.h)
+#endif
+#ifndef USE_SD
 #define USE_SD            0   // SD card config/logging (sd_config.h)
+#endif
+#ifndef USE_MESH
 #define USE_MESH          0   // multi-hop relay (mesh_relay.h)
+#endif
+#ifndef USE_CRYPTO
 #define USE_CRYPTO        0   // HMAC frame signing (crypto_peer.h)
+#endif
+#ifndef USE_COMPANION
 #define USE_COMPANION     0   // UART JSON companion app (companion_uart.h)
+#endif
 
 // FR-01: OTA requires crypto — fail at compile time if misconfigured.
 #if USE_OTA && !USE_CRYPTO
@@ -40,6 +57,13 @@
 #if (USE_PEER_PROTOCOL || USE_OTA || USE_MESH) && !USE_ESPNOW
 #undef USE_ESPNOW
 #define USE_ESPNOW 1
+#endif
+
+// The P4 has no radio; Arduino-ESP32 reaches the companion C6 through
+// esp_wifi_remote, which carries Wi-Fi but not ESP-NOW (esp_now_* never links).
+// Fail here with a readable message instead of a wall of linker errors.
+#if USE_ESPNOW && CONFIG_ESP_WIFI_REMOTE_ENABLED
+#error "ESP-NOW is unavailable on the ESP32-P4 under Arduino-ESP32 (Wi-Fi goes through the C6 via esp_wifi_remote, which has no ESP-NOW). USE_ESPNOW/USE_PEER_PROTOCOL/USE_OTA/USE_MESH cannot build for this target yet. See firmware/esp32_p4/README.md."
 #endif
 
 // ---- conditional includes --------------------------------------------------

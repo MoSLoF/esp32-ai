@@ -96,7 +96,7 @@ static bool sd_begin() {
 
 static void sd_end() {
   if (!_sd_mounted) return;
-  esp_vfs_fat_sdmmc_unmount(SD_MOUNT_POINT, _sd_card);
+  esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, _sd_card);
   _sd_card = NULL;
   _sd_mounted = false;
 }
